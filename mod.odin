@@ -10,7 +10,7 @@
 // duplicate `@(export) bifrost_lib_get_api` into its own DLL. rbs
 // automatically passes that flag when building THIS DLL and omits it
 // when building other DLLs (see Project/rbs/rbs.odin::component_build_flag).
-package BF_Renderer
+package BF_GPU
 
 import "core:log"
 import "../../Core"
@@ -98,7 +98,7 @@ destroy_renderer_extension_point :: proc(instance: rawptr) {
 // === MODULE_IDENTITY (parsed by rbs) ===
 IDENTITY :: Core.Lib_Descriptor {
 	api_version    = Core.LIB_API_VERSION,
-	name           = "BF_Renderer",
+	name           = "BF_GPU",
 	version        = Core.Version{0, 0, 1},
 	author         = "armscream",
 	description    = "PBR forward+ renderer with Vulkan and MoltenVK backends.",
@@ -109,6 +109,14 @@ IDENTITY :: Core.Lib_Descriptor {
 	dependencies   = {
 		{
 			name            = "BF_DAG",
+			min_version     = Core.Version{0, 0, 1},
+			max_version     = Core.Version{9, 9, 9},
+			has_max_version = true,
+			has_min_version = true,
+			optional        = false,
+		},
+		{
+			name            = "BF_ECS",
 			min_version     = Core.Version{0, 0, 1},
 			max_version     = Core.Version{9, 9, 9},
 			has_max_version = true,

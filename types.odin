@@ -1,15 +1,22 @@
 //BF_Renderer/types.odin
-package BF_Renderer
+package BF_GPU
 
 import "../../Core"
-import "../../Core/BF_Math"
+import mth "../../Core/BF_Math"
 import ECS "../BF_ECS"
-import hm "core:container/handle_map"
+import "base:runtime"
 
 // Culling ordering
 // ModelCull -> MeshCull -> MeshletCull
 // Chunk(spatial)(CPU) -> Frustum -> Zero-Pixel -> Hi-Z -> Cone (meshlet)
 // LOD is selected per Simple Large bound box and screen space % then indexed.
+
+Asset_ID :: Core.Asset_ID
+Asset_Ref :: Core.Asset_Ref
+Entity :: ECS.Entity
+Chunk_ID :: ECS.Chunk_ID
+Light_Type :: ECS.Light_Type
+Camera_Projection :: ECS.Camera_Projection
 
 GPU_Model_ID :: distinct u32
 GPU_Mesh_ID :: distinct u32
@@ -61,19 +68,20 @@ GPU_Resource_Store :: struct {
 	meshes:            [dynamic]GPU_Mesh,
 	materials:         [dynamic]GPU_Material,
 	textures:          [dynamic]GPU_Texture,
-	model_by_asset:    hm.Handle_Map(Asset_ID, GPU_Model_ID),
-	mesh_by_asset:     hm.Handle_Map(Asset_ID, GPU_Mesh_ID),
-	material_by_asset: hm.Handle_Map(Asset_ID, GPU_Material_ID),
-	texture_by_asset:  hm.Handle_Map(Asset_ID, GPU_Texture_ID),
+	model_by_asset:    map[ECS.Asset_ID]GPU_Model_ID,
+	mesh_by_asset:     map[ECS.Asset_ID]GPU_Mesh_ID,
+	material_by_asset: map[ECS.Asset_ID]GPU_Material_ID,
+	texture_by_asset:  map[ECS.Asset_ID]GPU_Texture_ID,
 }
 
 //* Render_Scene
 Render_Instance_ID :: distinct u32
-RENDER_INSTANCE_INVALID :: render_instance_id(0)
+RENDER_INSTANCE_INVALID :: Render_Instance_ID(0)
 
 Render_Instance :: struct {
 	entity:                  Entity,
 	model:                   Asset_Ref,
+	gpu_model:               GPU_Model_ID,
 	transform_index:         u32,
 	material_override_index: u32,
 	spatial_index:           u32,
@@ -114,13 +122,13 @@ Render_Scene :: struct {
 	lights:             [dynamic]Render_Light,
 	cameras:            [dynamic]Render_Camera,
 	particles:          [dynamic]Render_Particle,
-	entity_to_instance: hm.Handle_Map(Entity, Render_Instance_ID),
+	entity_to_instance: map[ECS.Entity]Render_Instance_ID,
 	frame_index:        u64,
 }
 
 //* Render Objects
 Render_Light :: struct {
-	entity:           ECS.Entity,
+	entity:           Entity,
 	transform_index:  u32,
 	type:             Light_Type,
 	colour:           mth.Vec3,
@@ -131,7 +139,7 @@ Render_Light :: struct {
 	shadow_map_index: u32,
 }
 Render_Camera :: struct {
-	entity:                 ECS.Entity,
+	entity:                 Entity,
 	transform_index:        u32,
 	projection:             Camera_Projection,
 	view:                   [16]f32,
@@ -143,8 +151,8 @@ Render_Camera :: struct {
 	height:                 u32,
 }
 Render_Particle :: struct {
-	entity:          ECS.Entity,
-	system:          Core.Asset_Ref,
+	entity:          Entity,
+	system:          Asset_Ref,
 	transform_index: u32,
 	emitter_index:   u32,
 	flags:           u32,
@@ -171,6 +179,9 @@ Render_Bucket_Key :: struct {
 	material_class: Render_Material_Class,
 	cull_mode:      Render_Cull_Mode,
 }
+
+Render_Domain :: enum u8 {} //TODO: add fields, verify if necessary
+
 
 Render_Pipeline :: enum u8 {
 	Traditional,
@@ -213,53 +224,54 @@ GPU_Scene :: struct {
 	transforms:        []Render_Transform,
 	lights:            []Render_Light,
 	cameras:           []Render_Camera,
+	culling:           []GPU_Culling_Instance,
 	visible_instances: []u32,
 	indirect_commands: []GPU_Indirect_Command,
 	bucket_counts:     []u32,
 }
 // Later the mesh-shader path gets a seperate command representation.
 GPU_Indirect_Command :: struct {
-	index_count: u32,
+	index_count:    u32,
 	instance_count: u32,
-    first_index: u32,
-    vertex_offset: i32,
-    first_instance: u32,
+	first_index:    u32,
+	vertex_offset:  i32,
+	first_instance: u32,
 }
 
 //* CULLING DATA
 Culling_Bounds :: struct {
-    centre: mth.Vec3,
-    radius: f32,
-    min: mth.Vec3,
-    max: mth.Vec3,
+	centre: mth.Vec3,
+	radius: f32,
+	min:    mth.Vec3,
+	max:    mth.Vec3,
 }
 Culling_Result :: enum u8 {
-    Unknown,
-    Visible,
-    Frustum_Culled,
-    Zero_Pixel_Culled,
-    HiZ_Culled,
-    Cone_Culled,
+	Unknown,
+	Visible,
+	Frustum_Culled,
+	Zero_Pixel_Culled,
+	HiZ_Culled,
+	Cone_Culled,
 }
 GPU_Culling_Instance :: struct {
-    instance: u32,
-    bounds: Culling_Bounds,
-    lod: u16,
-    result: Culling_Result,
-    flags: uu32,
+	instance: u32,
+	bounds:   Culling_Bounds,
+	lod:      u16,
+	result:   Culling_Result,
+	flags:    u32,
 }
 
 //* LOD
 LOD_Level :: struct {
-    screen_size: f32,
-    mesh: Core.Asset_Ref,
-    geometric_error: f32,
+	screen_size:     f32,
+	mesh:            Asset_Ref,
+	geometric_error: f32,
 }
 LOD_Set :: struct {
-    levels: []LOD_Level,
-    hysteresis: f32,
+	levels:     []LOD_Level,
+	hysteresis: f32,
 }
 GPU_LOD_Result :: struct {
-    lod: u16,
-    mesh: GPU_Mesh_ID,
+	lod:  u16,
+	mesh: GPU_Mesh_ID,
 }
