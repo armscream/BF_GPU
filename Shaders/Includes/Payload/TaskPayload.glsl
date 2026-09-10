@@ -1,0 +1,13 @@
+#ifndef BF_GPU_INCLUDES_TASK_PAYLOAD_H
+#define BF_GPU_INCLUDES_TASK_PAYLOAD_H
+
+struct TaskPayload {
+    uint drawId;
+    uint entityId;
+    uint transformDenseIdx;
+    uint activeCameraDenseIdx;
+    uint modelDenseIndex;
+    uint meshletIndices[32];
+};
+
+#endif

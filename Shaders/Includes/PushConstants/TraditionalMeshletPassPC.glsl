@@ -1,0 +1,13 @@
+#ifndef BF_GPU_INCLUDES_PC_TRADITIONAL_MESHLET_PASS_GLSL
+#define BF_GPU_INCLUDES_PC_TRADITIONAL_MESHLET_PASS_GLSL
+
+#include "../SharedGpuTypes.glsl"
+
+struct TraditionalMeshletPassPC {
+    uint64_t frameGlobalContextBufferAddr;
+    uint baseDescriptorOffset;
+    uint materialRenderType;
+    uint disableConeCulling;
+};
+
+#endif

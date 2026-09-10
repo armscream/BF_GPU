@@ -1,0 +1,83 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_buffer_reference2 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+#include "../../Includes/Core.glsl"
+#include "../../Includes/Common/FrameGlobalContext.glsl"
+#include "../../Includes/Common/Transform.glsl"
+#include "../../Includes/Common/Model.glsl"
+#include "../../Includes/Common/Mesh.glsl"
+#include "../../Includes/Common/StaticChunk.glsl"
+#include "../../Includes/Utils/CullingMath.glsl"
+#include "../../Includes/Utils/AtomicFloatUtils.glsl"
+#include "../../Includes/Common/Animation.glsl"
+
+layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+
+#include "../../Includes/PushConstants/ChunkBuilderPC.glsl"
+
+layout(push_constant) uniform PushConstants {
+    ChunkBuilderPC pc;
+};
+
+void main() {
+    FrameGlobalContext ctx = GET_FRAME_CONTEXT(pc.frameGlobalContextBufferAddr);
+    uint transformDenseIndex = gl_GlobalInvocationID.x;
+    
+    vec3 localMin = BOUNDS_INIT_MIN;
+    vec3 localMax = BOUNDS_INIT_MAX;
+
+    //Todo: Ne csak static?
+    if (transformDenseIndex < ctx.staticTransformCount) {
+        TransformModelLink link = GET_TRANSFORM_MODEL_LINK(ctx.transformModelLinkBufferAddr, transformDenseIndex);
+        TransformComponent transform = GET_TRANSFORM(ctx.transformBufferAddr, transformDenseIndex);
+        
+        vec3 translation = vec3(transform.transform[3]);
+        vec3 scale = vec3(length(transform.transform[0]), length(transform.transform[1]), length(transform.transform[2]));
+            
+        localMin = translation - scale;
+        localMax = translation + scale;
+
+        if (link.modelDenseIndex != INVALID_INDEX) {
+            ModelComponent modelComp = GET_MODEL_COMP(ctx.modelBufferAddr, link.modelDenseIndex);
+            
+            if (modelComp.modelIndex != INVALID_INDEX) {
+                    GpuModelAddresses addrs = GET_MODEL_ADDRESSES(ctx.modelAddressBufferAddr, modelComp.modelIndex);
+                    GpuMeshCollider collider = addrs.globalCollider;
+
+                    if (ctx.animationSparseMapBufferAddr != 0) {
+                        uint animSparseIndex = GET_SPARSE_INDEX(ctx.animationSparseMapBufferAddr, link.entityIndex);
+                        if (animSparseIndex != INVALID_INDEX) {
+                            AnimationComponent animComp = GET_ANIM_COMP(ctx.animationBufferAddr, animSparseIndex);
+                            if (animComp.animationIndex != INVALID_INDEX) {
+                                GpuAnimationAddresses animAddrs = GET_ANIM_ADDRESSES(ctx.animationAddressBufferAddr, animComp.animationIndex);
+
+                                if (animAddrs.isReady == 1) {
+                                    collider = animAddrs.globalCollider;
+                                }
+                            }
+                        }
+                    }
+
+                    GpuMeshCollider worldCollider = TransformCollider(collider, transform.transform);
+                    localMin = worldCollider.aabbMin;
+                    localMax = worldCollider.aabbMax;     
+                }
+        }
+    }
+
+    vec3 sgMin = subgroupMin(localMin);
+    vec3 sgMax = subgroupMax(localMax);
+
+    if (subgroupElect()) {
+        atomicMin(GET_SCENE_AABB(ctx.sceneAabbBufferAddr).minX, floatToSortableUint(sgMin.x));
+        atomicMin(GET_SCENE_AABB(ctx.sceneAabbBufferAddr).minY, floatToSortableUint(sgMin.y));
+        atomicMin(GET_SCENE_AABB(ctx.sceneAabbBufferAddr).minZ, floatToSortableUint(sgMin.z));
+        
+        atomicMax(GET_SCENE_AABB(ctx.sceneAabbBufferAddr).maxX, floatToSortableUint(sgMax.x));
+        atomicMax(GET_SCENE_AABB(ctx.sceneAabbBufferAddr).maxY, floatToSortableUint(sgMax.y));
+        atomicMax(GET_SCENE_AABB(ctx.sceneAabbBufferAddr).maxZ, floatToSortableUint(sgMax.z));
+    }
+}

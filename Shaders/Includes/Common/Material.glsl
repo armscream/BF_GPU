@@ -1,0 +1,70 @@
+#ifndef BF_GPU_INCLUDES_COMMON_MATERIAL_GLSL
+#define BF_GPU_INCLUDES_COMMON_MATERIAL_GLSL
+
+#include "../Core.glsl"
+
+struct Material { 
+    vec4 color;
+    vec3 emissiveColor;
+    float emissiveIntensity;
+    vec2 uvScale;
+    float metalness;
+    float roughness;
+    float aoStrength;
+    uint packedFlags;
+    float clearcoatFactor;
+    float clearcoatRoughness;
+    vec3 specularColor;
+    float specularFactor;
+    float ior;
+    uint albedoTexture;
+    uint normalTexture;
+    uint metalnessTexture;
+    uint roughnessTexture;
+    uint metallicRoughnessTexture;
+    uint emissiveTexture;
+    uint ambientOcclusionTexture;
+    uint opacityTexture;
+    uint clearcoatTexture;
+    uint clearcoatRoughnessTexture;
+    uint clearcoatNormalTexture;
+    uint specularTexture;
+    uint specularColorTexture;
+    uint videoTexture;
+    uint padding1;
+};
+
+layout(buffer_reference, std430) readonly restrict buffer MaterialBuffer { Material data[]; };
+layout(buffer_reference, std430) readonly restrict buffer MaterialLookupBuffer { uint data[]; };
+
+#define INVALID_SAMPLER_INDEX 0xFF
+
+#define GET_MATERIAL(addr, idx)         MaterialBuffer(addr).data[idx]
+#define GET_MATERIAL_INDEX(addr, idx)   MaterialLookupBuffer(addr).data[idx]
+
+#define HAS_VALID_TEXTURE(texIdx) ((texIdx) != INVALID_INDEX)
+
+#define UNPACK_TEXTURE_ID(packedVal)  ((packedVal) & 0x00FFFFFF)
+#define UNPACK_SAMPLER_ID(packedVal)  ((packedVal) >> 24)
+
+#define IS_DOUBLE_SIDED(mat)    HAS_FLAG((mat).packedFlags, 0)
+#define IS_TRANSPARENT(mat)     HAS_FLAG((mat).packedFlags, 1)
+#define IS_ALPHA_TESTED(mat)    HAS_FLAG((mat).packedFlags, 2)
+
+#define HAS_ALBEDO_TEX(mat)             HAS_VALID_TEXTURE((mat).albedoTexture)
+#define HAS_NORMAL_TEX(mat)             HAS_VALID_TEXTURE((mat).normalTexture)
+#define HAS_METALNESS_TEX(mat)          HAS_VALID_TEXTURE((mat).metalnessTexture)
+#define HAS_ROUGHNESS_TEX(mat)          HAS_VALID_TEXTURE((mat).roughnessTexture)
+#define HAS_METALLIC_ROUGHNESS_TEX(mat) HAS_VALID_TEXTURE((mat).metallicRoughnessTexture)
+#define HAS_EMISSIVE_TEX(mat)           HAS_VALID_TEXTURE((mat).emissiveTexture)
+#define HAS_AO_TEX(mat)                 HAS_VALID_TEXTURE((mat).ambientOcclusionTexture)
+#define HAS_OPACITY_TEX(mat)            HAS_VALID_TEXTURE((mat).opacityTexture)
+
+#define HAS_CLEARCOAT_TEX(mat)          HAS_VALID_TEXTURE((mat).clearcoatTexture)
+#define HAS_CLEARCOAT_ROUGHNESS_TEX(mat) HAS_VALID_TEXTURE((mat).clearcoatRoughnessTexture)
+#define HAS_CLEARCOAT_NORMAL_TEX(mat)   HAS_VALID_TEXTURE((mat).clearcoatNormalTexture)
+#define HAS_SPECULAR_TEX(mat)           HAS_VALID_TEXTURE((mat).specularTexture)
+#define HAS_SPECULAR_COLOR_TEX(mat)     HAS_VALID_TEXTURE((mat).specularColorTexture)
+#define HAS_VIDEO_TEX(mat)              HAS_VALID_TEXTURE((mat).videoTexture)
+
+#endif

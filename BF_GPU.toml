@@ -1,13 +1,13 @@
 api_version = 1
-name = "BF_Renderer"
+name = "BF_GPU"
 component_kind = "Module"
 type = "Renderer"
 version = { major = 0, minor = 0, patch = 1 }
 author = "armscream"
-description = "PBR forward+ renderer with Vulkan and MoltenVK backends."
+description = "GPU-driven visibility-buffer renderer with Vulkan and MoltenVK backends."
 flags = ["Runtime"]
 capabilities = ["Renderer", "GPU", "Materials", "Textures"]
-dependency_count = 1
+dependency_count = 3
 
 [[dependencies]]
 name = "BF_DAG"
@@ -16,3 +16,17 @@ max_version = { major = 9, minor = 9, patch = 9 }
 has_min_version = true
 has_max_version = true
 optional = false
+[[dependencies]]
+name = "BF_ECS"
+min_version = { major = 0, minor = 0, patch = 1 }
+max_version = { major = 9, minor = 9, patch = 9 }
+has_min_version = true
+has_max_version = true
+optional = false
+[[dependencies]]
+name = "BF_Input"
+min_version = { major = 0, minor = 0, patch = 1 }
+max_version = { major = 9, minor = 9, patch = 9 }
+has_min_version = true
+has_max_version = true
+optional = true
