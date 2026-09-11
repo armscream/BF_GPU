@@ -306,7 +306,7 @@ module_register :: proc(ctx: ^Core.Lib_Context) -> bool {
 	// scheduler_build.
 	renderer_register_systems()
 
-	log.info("[Renderer] Extension point service + Input_Backend + 3 DAG systems registered.")
+	log.info("[Renderer] Extension point service + Input_Backend + 4 DAG systems registered.")
 	return true
 }
 
