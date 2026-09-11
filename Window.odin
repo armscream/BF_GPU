@@ -364,3 +364,24 @@ register_input_backend_service :: proc(ctx: ^Core.Lib_Context, backend: ^INPUT.I
 		log.warn("[BF_GPU] failed to register Input_Backend service")
 	}
 }
+
+
+//* VULKAN BABY
+// TODO: Implement this through SDL's Vulkan extension query.
+// This gives the multiplatform surface extensions provided by SDL3.
+window_vulkan_instance_extensions :: proc() -> []cstring
+
+
+vulkan_create_surface :: proc() -> bool {
+	window := window_get_native()
+	if window == nil {
+		log.error("[BF_GPU/Vulkan] SDL window is null")
+		return false
+	}
+	result := sdl_vulkan_create_surface(window, VULKAN_STATE.instance, &VULKAN_STATE.surface)
+	if !result {
+		log.error("[BF_GPU/Vulkan] Failed to create Vulkan surface")
+		return false
+	}
+	return true
+}
