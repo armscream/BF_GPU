@@ -122,7 +122,6 @@ Scene_Sparse_Maps :: struct {
 	models:     Sparse_Map,
 	cameras:    Sparse_Map,
 	tags:       Sparse_Map,
-	animations: Sparse_Map,
 }
 
 // ---------------------------------------------------------------------------
@@ -223,8 +222,6 @@ gpu_scene_init :: proc(
 	gpu.sparse.cameras.dense_to_entity = make([dynamic]u32, 0, 16, allocator)
 	gpu.sparse.tags.entity_to_dense = make([dynamic]u32, 0, DEFAULT_SPARSE_CAPACITY, allocator)
 	gpu.sparse.tags.dense_to_entity = make([dynamic]u32, 0, DEFAULT_POOL_CAPACITY, allocator)
-	gpu.sparse.animations.entity_to_dense = make([dynamic]u32, 0, DEFAULT_SPARSE_CAPACITY, allocator)
-	gpu.sparse.animations.dense_to_entity = make([dynamic]u32, 0, DEFAULT_POOL_CAPACITY, allocator)
 }
 
 gpu_scene_destroy :: proc(gpu: ^GPU_Scene) {
@@ -256,8 +253,6 @@ gpu_scene_destroy :: proc(gpu: ^GPU_Scene) {
 	delete(gpu.sparse.cameras.dense_to_entity)
 	delete(gpu.sparse.tags.entity_to_dense)
 	delete(gpu.sparse.tags.dense_to_entity)
-	delete(gpu.sparse.animations.entity_to_dense)
-	delete(gpu.sparse.animations.dense_to_entity)
 	gpu^ = {}
 }
 

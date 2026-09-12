@@ -1,7 +1,8 @@
 package BF_GPU
 
+import vma "../../dependencies/odin-vma"
 import "core:log"
-import "core:sync"
+import sdl "vendor:sdl3"
 import vk "vendor:vulkan"
 
 Vulkan_Queue_Family :: struct {
@@ -20,9 +21,9 @@ Vulkan_Frame :: struct {
 	command_pool:    vk.CommandPool,
 	command_buffer:  vk.CommandBuffer,
 	//
+	// WSI synchronization
 	image_available: vk.Semaphore,
 	render_finished: vk.Semaphore,
-	fence:           vk.Fence,
 }
 
 //* SWAPCHAIN
@@ -36,24 +37,33 @@ Vulkan_Swapchain :: struct {
 }
 
 Vulkan_Context :: struct {
-	instance:        vk.Instance,
+	instance:                vk.Instance,
 	//
-	physical_device: vk.PhysicalDevice,
-	device:          vk.Device,
+	physical_device:         vk.PhysicalDevice,
+	device:                  vk.Device,
 	//
-	queues:          Vulkan_Queue_Family,
+	queues:                  Vulkan_Queue_Family,
 	//
-	graphics_queue:  vk.Queue,
-	compute_queue:   vk.Queue,
-	transfer_queue:  vk.Queue,
-	present_queue:   vk.Queue,
+	graphics_queue:          vk.Queue,
+	compute_queue:           vk.Queue,
+	transfer_queue:          vk.Queue,
+	present_queue:           vk.Queue,
 	//
-	surface:         vk.SurfaceKHR,
+	surface:                 vk.SurfaceKHR,
+	// Memory
+	allocator:               vma.Allocator,
+	// timeline
+	graphics_timeline:       vk.Semaphore,
+	compute_timeline:        vk.Semaphore,
+	transfer_timeline:       vk.Semaphore,
+	graphics_timeline_value: u64,
+	compute_timeline_value:  u64,
+	transfer_timeline_value: u64,
 	//
-	frames:          [MAX_FRAMES_IN_FLIGHT]Vulkan_Frame,
-	frame_index:     u32,
+	frames:                  [MAX_FRAMES_IN_FLIGHT]Vulkan_Frame,
+	frame_index:             u32,
 	//
-	initialized:     bool,
+	initialized:             bool,
 }
 
 MAX_FRAMES_IN_FLIGHT :: 2
@@ -64,6 +74,22 @@ VULKAN_STATE: Vulkan_Context
 //////////////////////////////////////////////////////////////////////////////////////
 //* LIFECYCLE CODE
 vulkan_init :: proc() -> bool {
+	// Initializes a subset of Vulkan functions required by VMA
+	vma_vulkan_functions := vma.create_vulkan_functions()
+
+	vma_create_info: vma.AllocatorCreateInfo = {
+		flags            = {.BUFFER_DEVICE_ADDRESS},
+		instance         = vk_instance,
+		physicalDevice   = vk_physical_device,
+		device           = vk_device,
+		pVulkanFunctions = &vma_vulkan_functions,
+		vulkanApiVersion = api_version,
+	}
+
+	// Create the VMA (Vulkan Memory Allocator)
+	allocator: vma.Allocator = ---
+	vma.CreateAllocator(vma_create_info, &allocator)
+
 	if !vulkan_create_instance() do return false
 	if !vulkan_create_surface() do return false
 	if !vulkan_pick_physical_device() do return false
@@ -93,6 +119,8 @@ vulkan_shutdown :: proc() {
 	if VULKAN_STATE.surface !=
 	   nil {vk.DestroySurfaceKHR(VULKAN_STATE.instance, VULKAN_STATE.surface, nil)}
 	if VULKAN_STATE.instance != nil {vk.DestroyInstance(VULKAN_STATE.instance, nil)}
+	// Destroy VMA
+	vma.DestroyAllocator(allocator)
 	VULKAN_STATE = {}
 }
 /////////////////////////////////////////////////////////////////////////
@@ -174,31 +202,47 @@ vulkan_find_queue_families :: proc(device: vk.PhysicalDevice) -> Vulkan_Queue_Fa
 
 	vk.GetPhysicalDeviceQueueFamilyProperties(device, &count, raw_data(properties))
 
+	// First pass: prefer dedicated compute/transfer families.
+
 	for i, props in properties {
 		family := u32(i)
-		if .GRAPHICS in props.queueFlags {
-			result.graphics = family
-			result.has_graphics = true
-		}
-		if .COMPUTE in props.queueFlags {
-			result.compute = family
-			result.has_compute = true
-		}
-		if .TRANSFER in props.queueFlags {
+
+		has_graphics := .GRAPHICS in props.queueFlags
+		has_compute := .COMPUTE in props.queueFlags
+		has_transfer := .TRANSFER in props.queueFlags
+
+		if .TRANSFER && !has_graphics && !has_compute {
 			result.transfer = family
 			result.has_transfer = true
 		}
+		if has_compute && !has_graphics {
+			result.compute = family
+			result.has_compute = true
+		}
+	}
 
-		present_supported: int
-		vk.GetPhysicalDeviceSurfaceSupportKHR(
-			device,
-			family,
-			VULKAN_STATE.surface,
-			&present_supported,
-		)
-		if present_supported != 0 {
-			result.present = family
-			result.has_present = true
+    // Second pass: fill general-purpose queues.
+	for i, props in properties {
+		family := u32(i)
+		if .GRAPHICS in props.queueFlags {
+			if !result.has_graphics {
+				result.graphics = family
+				result.has_graphics = true
+			}
+		}
+		if !result.has_compute && .COMPUTE in props.queueFlags {
+			result.compute = family
+			result.has_compute = true
+		}
+		if !result.has_transfer && .TRANSFER in props.queueFlags {
+			result.transfer = family
+			result.has_transfer = true
+		}
+		if sdl.Vulkan_GetPresentationSupport(VULKAN_STATE.instance, device, family) {
+			if !result.has_present {
+				result.present = family
+				result.has_present = true
+			}
 		}
 	}
 	return result
@@ -266,7 +310,13 @@ vulkan_create_device :: proc() -> bool {
 	vk.GetDeviceQueue(VULKAN_STATE.device, queues.compute, 0, &VULKAN_STATE.compute_queue)
 	vk.GetDeviceQueue(VULKAN_STATE.device, queues.transfer, 0, &VULKAN_STATE.transfer_queue)
 	vk.GetDeviceQueue(VULKAN_STATE.device, queues.present, 0, &VULKAN_STATE.present_queue)
-    log.infof("[BF_GPU/Vulkan] Device queues: graphics=%d compute=%d transfer=%d present=%d", queues.graphics, queues.compute, queues.transfer, queues.present)
+	log.infof(
+		"[BF_GPU/Vulkan] Device queues: graphics=%d compute=%d transfer=%d present=%d",
+		queues.graphics,
+		queues.compute,
+		queues.transfer,
+		queues.present,
+	)
 	return true
 }
 

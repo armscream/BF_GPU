@@ -369,11 +369,21 @@ vulkan_create_surface :: proc() -> bool {
 	window := window_get_handle()
 	if window.handle == nil {log.error("[BF_GPU] window handle is null"); return false}
 
-	// TODO: Call the actual vendor:sdl3 Vulkan surface creation API here.
-	VKSurface := sdl.Vulkan_CreateSurface(window, instance,)
-	// the resulting VkSurfaceKHR must be written to: VULKAN_STATE.surface
-	// and then mirrored through: window_set_surface(..)
-
-	log.error("[BF_GPU] Vulkan surface creation not implemented")
+	sdl_window := cast(^sdl.Window)window.handle
+	if !sdl.Vulkan_CreateSurface(sdl_window, VULKAN_STATE.instance, nil, &VULKAN_STATE.surface){
+		log.errorf("[BF_GPU/Vulkan] ")
+	}
 	return false
+}
+
+window_vulkan_instance_extensions :: proc() -> []cstring {
+	count: u32
+	names := sdl.Vulkan_GetInstanceExtensions(&count)
+	if names == nil || count == 0 {
+		log.error("[BF_GPU/Vulkan] SDL returned no Vulkan instance extensions")
+		return nil
+	}
+	result := make([]cstring, count)
+	for i in 0..<count {result[i] = names[i]}
+	return result
 }
