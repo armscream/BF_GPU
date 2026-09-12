@@ -61,17 +61,41 @@ MAX_FRAMES_IN_FLIGHT :: 2
 @(private)
 VULKAN_STATE: Vulkan_Context
 
+//////////////////////////////////////////////////////////////////////////////////////
+//* LIFECYCLE CODE
 vulkan_init :: proc() -> bool {
-    if !vulkan_create_instance() do return false
-    if !vulkan_create_surface() do return false
-    if !vulkan_pick_physical_device() do return false
-    if !vulkan_create_device() do return false
-    if !vulkan_create_command_resources() do return false
-    if !vulkan_create_swapchain() do return false
-    if !vulkan_create_sync_objects() do return false
-
-    return true
+	if !vulkan_create_instance() do return false
+	if !vulkan_create_surface() do return false
+	if !vulkan_pick_physical_device() do return false
+	if !vulkan_create_device() do return false
+	if !vulkan_create_command_resources() do return false
+	if !vulkan_create_swapchain() do return false // TODO: create swapchain, and make it recreate after resize
+	if !vulkan_create_sync_objects() do return false
+	VULKAN_STATE.initialized = true
+	log.info("[BF_GPU/Vulkan] Vulkan backend initialized")
+	return true
 }
+
+vulkan_shutdown :: proc() {
+	if !VULKAN_STATE.initialized && VULKAN_STATE.device == nil do return
+	vk.DeviceWaitIdle(VULKAN_STATE.device)
+	for i in 0 ..< MAX_FRAMES_IN_FLIGHT {
+		frame := &VULKAN_STATE.frames[i]
+		if frame.image_available !=
+		   nil {vk.DestroySemaphore(VULKAN_STATE.device, frame.image_available, nil)}
+		if frame.render_finished !=
+		   nil {vk.DestroySemaphore(VULKAN_STATE.device, frame.render_finished, nil)}
+		if frame.fence != nil {vk.DestroyFence(VULKAN_STATE.device, frame.fence, nil)}
+		if frame.command_pool !=
+		   nil {vk.DestroyCommandPool(VULKAN_STATE.device, frame.command_pool, nil)}
+	}
+	vk.DestroyDevice(VULKAN_STATE.device, nil)
+	if VULKAN_STATE.surface !=
+	   nil {vk.DestroySurfaceKHR(VULKAN_STATE.instance, VULKAN_STATE.surface, nil)}
+	if VULKAN_STATE.instance != nil {vk.DestroyInstance(VULKAN_STATE.instance, nil)}
+	VULKAN_STATE = {}
+}
+/////////////////////////////////////////////////////////////////////////
 
 vulkan_create_instance :: proc() -> bool {
 	app_info := vk.ApplicationInfo {
@@ -132,8 +156,11 @@ vulkan_device_is_suitable :: proc(device: vk.PhysicalDevice) -> bool {
 	queues := vulkan_find_queue_families(device)
 	if !queues.has_graphics do return false
 	if !queues.has_present do return false
+	if !queues.has_compute do return false
+	if !queues.has_transfer do return false
 
-	if !vulkan_check_device_extensions(device) do return false
+	// if !vulkan_check_device_extensions(device) do return false
+	VULKAN_STATE.queues = queues
 	return true
 }
 
@@ -148,28 +175,29 @@ vulkan_find_queue_families :: proc(device: vk.PhysicalDevice) -> Vulkan_Queue_Fa
 	vk.GetPhysicalDeviceQueueFamilyProperties(device, &count, raw_data(properties))
 
 	for i, props in properties {
+		family := u32(i)
 		if .GRAPHICS in props.queueFlags {
-			result.graphics = u32(i)
+			result.graphics = family
 			result.has_graphics = true
 		}
 		if .COMPUTE in props.queueFlags {
-			result.compute = u32(i)
+			result.compute = family
 			result.has_compute = true
 		}
-        if .TRANSFER in props.queueFlags {
-			result.transfer = u32(i)
+		if .TRANSFER in props.queueFlags {
+			result.transfer = family
 			result.has_transfer = true
 		}
 
 		present_supported: int
 		vk.GetPhysicalDeviceSurfaceSupportKHR(
 			device,
-			u32(i),
+			family,
 			VULKAN_STATE.surface,
 			&present_supported,
 		)
 		if present_supported != 0 {
-			result.present = u32(i)
+			result.present = family
 			result.has_present = true
 		}
 	}
@@ -181,28 +209,23 @@ vulkan_create_device :: proc() -> bool {
 	queues := VULKAN_STATE.queues
 	priority: f32 = 1.0
 	queue_infos: [dynamic]vk.DeviceQueueCreateInfo
-
-	append(
-		&queue_infos,
-		vk.DeviceQueueCreateInfo {
-			sType = .DEVICE_QUEUE_CREATE_INFO,
-			queueFamilyIndex = queues.graphics,
-			queueCount = 1,
-			pQueuePriorities = &priority,
-		},
-	)
-
-	if queues.present != queues.graphics {
+	append_queue := proc(family: u32) {
+		for info in queue_infos {if info.queueFamilyIndex == family do return}
 		append(
 			&queue_infos,
 			vk.DeviceQueueCreateInfo {
 				sType = .DEVICE_QUEUE_CREATE_INFO,
-				queueFamilyIndex = queues.present,
+				queueFamilyIndex = family,
 				queueCount = 1,
 				pQueuePriorities = &priority,
 			},
 		)
 	}
+
+	append_queue(queues.graphics)
+	append_queue(queues.compute)
+	append_queue(queues.transfer)
+	append_queue(queues.present)
 
 	features13 := vk.PhysicalDeviceVulkan13Features {
 		sType            = .PHYSICAL_DEVICE_VULKAN_1_3_FEATURES,
@@ -240,6 +263,104 @@ vulkan_create_device :: proc() -> bool {
 
 	vk.load_proc_addresses_device(VULKAN_STATE.device)
 	vk.GetDeviceQueue(VULKAN_STATE.device, queues.graphics, 0, &VULKAN_STATE.graphics_queue)
+	vk.GetDeviceQueue(VULKAN_STATE.device, queues.compute, 0, &VULKAN_STATE.compute_queue)
+	vk.GetDeviceQueue(VULKAN_STATE.device, queues.transfer, 0, &VULKAN_STATE.transfer_queue)
 	vk.GetDeviceQueue(VULKAN_STATE.device, queues.present, 0, &VULKAN_STATE.present_queue)
+    log.infof("[BF_GPU/Vulkan] Device queues: graphics=%d compute=%d transfer=%d present=%d", queues.graphics, queues.compute, queues.transfer, queues.present)
+	return true
+}
+
+vulkan_append_unique_queue_family :: proc(
+	infos: ^[dynamic]vk.DeviceQueueCreateInfo,
+	family: u32,
+	priority: ^f32,
+) {
+	for info in infos {if info.queueFamilyIndex == family do return}
+	append(
+		infos,
+		vk.DeviceQueueCreateInfo {
+			sType = .DEVICE_QUEUE_CREATE_INFO,
+			queueFamilyIndex = family,
+			queueCount = 1,
+			pQueuePriorities = priority,
+		},
+	)
+}
+
+//* Create the command buffers per frame in flight (really just two atm, could do 3).
+// A resettable per-frame pool is useful for re-recording every frame.
+vulkan_create_command_resources :: proc() -> bool {
+	for i in 0 ..< MAX_FRAMES_IN_FLIGHT {
+		frame := &VULKAN_STATE.frames[i]
+		pool_info := vk.CommandPoolCreateInfo {
+			sType            = .COMMAND_POOL_CREATE_INFO,
+			flags            = {.RESET_COMMAND_BUFFER},
+			queueFamilyIndex = VULKAN_STATE.queues.graphics,
+		}
+		result := vk.CreateCommandPool(VULKAN_STATE.device, &pool_info, nil, &frame.command_pool)
+		if result != .SUCCESS {
+			log.errorf("[BF_GPU/Vulkan] vkCreateCommandPool failed for frame %d: %v", i, result)
+			return false
+		}
+		allocate_info := vk.CommandBufferAllocateInfo {
+			sType              = .COMMAND_BUFFER_ALLOCATE_INFO,
+			commandPool        = frame.command_pool,
+			level              = .PRIMARY,
+			commandBufferCount = 1,
+		}
+		result = vk.AllocateCommandBuffers(
+			VULKAN_STATE.device,
+			&allocate_info,
+			&frame.command_buffer,
+		)
+		if result != .SUCCESS {
+			log.errorf(
+				"[BF_GPU/Vulkan] vkAllocateCommandBuffers failed for frame %d: %v",
+				i,
+				result,
+			)
+			return false
+		}
+	}
+	return true
+}
+// Fence starts signaled bc otherwise the first frame would wait forever for a fence that was never submitted.
+vulkan_create_sync_objects :: proc() -> bool {
+	semaphore_info := vk.SemaphoreCreateInfo {
+		sType = .SEMAPHORE_CREATE_INFO,
+	}
+	fence_info := vk.FenceCreateInfo {
+		sType = .FENCE_CREATE_INFO,
+		flags = {.SIGNALED},
+	}
+
+	for i in 0 ..< MAX_FRAMES_IN_FLIGHT {
+		frame := &VULKAN_STATE.frames[i]
+		result := vk.CreateSemaphore(
+			VULKAN_STATE.device,
+			&semaphore_info,
+			nil,
+			&frame.image_available,
+		)
+		if result != .SUCCESS {
+			log.errorf("[BF_GPU/Vulkan] image_available semaphore creation failed: %v", result)
+			return false
+		}
+		result = vk.CreateSemaphore(
+			VULKAN_STATE.device,
+			&semaphore_info,
+			nil,
+			&frame.render_finished,
+		)
+		if result != .SUCCESS {
+			log.errorf("[BF_GPU/Vulkan] render_finished semaphore creation failed: %v", result)
+			return false
+		}
+		result = vk.CreateFence(VULKAN_STATE.device, &fence_info, nil, &frame.fence)
+		if result != .SUCCESS {
+			log.errorf("[BF_GPU/Vulkan] fence creation failed: %v", result)
+			return false
+		}
+	}
 	return true
 }

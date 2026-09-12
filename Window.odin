@@ -365,23 +365,15 @@ register_input_backend_service :: proc(ctx: ^Core.Lib_Context, backend: ^INPUT.I
 	}
 }
 
-
-//* VULKAN BABY
-// TODO: Implement this through SDL's Vulkan extension query.
-// This gives the multiplatform surface extensions provided by SDL3.
-window_vulkan_instance_extensions :: proc() -> []cstring
-
-
 vulkan_create_surface :: proc() -> bool {
-	window := window_get_native()
-	if window == nil {
-		log.error("[BF_GPU/Vulkan] SDL window is null")
-		return false
-	}
-	result := sdl_vulkan_create_surface(window, VULKAN_STATE.instance, &VULKAN_STATE.surface)
-	if !result {
-		log.error("[BF_GPU/Vulkan] Failed to create Vulkan surface")
-		return false
-	}
-	return true
+	window := window_get_handle()
+	if window.handle == nil {log.error("[BF_GPU] window handle is null"); return false}
+
+	// TODO: Call the actual vendor:sdl3 Vulkan surface creation API here.
+	VKSurface := sdl.Vulkan_CreateSurface(window, instance,)
+	// the resulting VkSurfaceKHR must be written to: VULKAN_STATE.surface
+	// and then mirrored through: window_set_surface(..)
+
+	log.error("[BF_GPU] Vulkan surface creation not implemented")
+	return false
 }

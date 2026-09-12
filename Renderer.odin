@@ -147,7 +147,10 @@ renderer_init :: proc(settings: GPU_Runtime_Settings, allocator := context.alloc
 	}
 	extraction_source_init(&s.source, s.world, &s.store)
 
-	ok := vulkan_init();assert(ok)
+	if !vulkan_init() {
+		log.error("[BF_GPU] Failed to initialize Vulkan")
+		return false
+	}
 
 	// Persistent buffer creation is the backend's job. Once the backend
 	// calls create_buffer() for every Gpu_Buffer_Kind, refresh_frame_addresses()

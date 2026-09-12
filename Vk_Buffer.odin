@@ -88,15 +88,3 @@ vulkan_create_renderer_buffers :: proc(
     refresh_frame_addresses(frame)
     return true
 }
-
-// dont know about this.
-vulkan_upload_scene :: proc(
-    scene: ^Render_Scene_State,
-    frame: ^Frame_Context_State,
-) -> bool {
-    if !upload_transforms(scene, frame) do return false
-    if !upload_models(scene, frame) do return false
-    if !upload_mesh_allocations(scene, frame) do return false
-    if !upload_cameras(scene, frame) do return false
-    return true
-}

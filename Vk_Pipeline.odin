@@ -49,7 +49,7 @@ renderer_build_default_passes :: proc(r: ^Vulkan_Renderer){
     renderer_register_compute_pass(
         r, 
         "Shading.Traditional",
-        shader_path("Shading/Traditiional.vert"),
-        shader_path("Shading/Traditiional.frag")
+        shader_path("Shading/Traditional.vert"),
+        shader_path("Shading/Traditional.frag")
     )
 }
