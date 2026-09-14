@@ -1,11 +1,12 @@
 package BF_GPU
 
+import vma "../../dependencies/odin-vma"
 import "core:log"
 import vk "vendor:vulkan"
 
 Vulkan_Buffer :: struct {
 	buffer:      vk.Buffer,
-	memory:      vk.DeviceMemory,
+	allocation:  vma.Allocation,
 	size:        vk.DeviceSize,
 	defice_addr: vk.DeviceAddress,
 }
