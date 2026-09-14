@@ -74,26 +74,11 @@ VULKAN_STATE: Vulkan_Context
 //////////////////////////////////////////////////////////////////////////////////////
 //* LIFECYCLE CODE
 vulkan_init :: proc() -> bool {
-	// Initializes a subset of Vulkan functions required by VMA
-	vma_vulkan_functions := vma.create_vulkan_functions()
-
-	vma_create_info: vma.AllocatorCreateInfo = {
-		flags            = {.BUFFER_DEVICE_ADDRESS},
-		instance         = vk_instance,
-		physicalDevice   = vk_physical_device,
-		device           = vk_device,
-		pVulkanFunctions = &vma_vulkan_functions,
-		vulkanApiVersion = api_version,
-	}
-
-	// Create the VMA (Vulkan Memory Allocator)
-	allocator: vma.Allocator = ---
-	vma.CreateAllocator(vma_create_info, &allocator)
-
 	if !vulkan_create_instance() do return false
 	if !vulkan_create_surface() do return false
 	if !vulkan_pick_physical_device() do return false
 	if !vulkan_create_device() do return false
+	if !vulkan_create_allocator() do return false
 	if !vulkan_create_command_resources() do return false
 	if !vulkan_create_swapchain() do return false // TODO: create swapchain, and make it recreate after resize
 	if !vulkan_create_sync_objects() do return false
@@ -284,6 +269,7 @@ vulkan_create_device :: proc() -> bool {
 		runtimeDescriptorArray                   = true,
 		descriptorBindingPartiallyBound          = true,
 		descriptorBindingVariableDescriptorCount = true,
+		drawIndirectCount                        = true,
 	}
 	features12.pNext = &features13
 
@@ -379,10 +365,6 @@ vulkan_create_sync_objects :: proc() -> bool {
 	semaphore_info := vk.SemaphoreCreateInfo {
 		sType = .SEMAPHORE_CREATE_INFO,
 	}
-	fence_info := vk.FenceCreateInfo {
-		sType = .FENCE_CREATE_INFO,
-		flags = {.SIGNALED},
-	}
 
 	for i in 0 ..< MAX_FRAMES_IN_FLIGHT {
 		frame := &VULKAN_STATE.frames[i]
@@ -406,11 +388,48 @@ vulkan_create_sync_objects :: proc() -> bool {
 			log.errorf("[BF_GPU/Vulkan] render_finished semaphore creation failed: %v", result)
 			return false
 		}
-		result = vk.CreateFence(VULKAN_STATE.device, &fence_info, nil, &frame.fence)
-		if result != .SUCCESS {
-			log.errorf("[BF_GPU/Vulkan] fence creation failed: %v", result)
-			return false
-		}
 	}
+	return vulkan_create_timeline_semaphores()
+}
+
+vulkan_create_allocator :: proc() -> bool {
+	functions := vma.create_vulkan_functions()
+
+	create_info := vma.AllocatorCreateInfo {
+		flags = {.BUFFER_DEVICE_ADDRESS},
+		instance = VULKAN_STATE.instance,
+		physical_device = VULKAN_STATE.physical_device,
+		device = VULKAN_STATE.device,
+		pVulkanFunctions = &functions,
+		vulkanApiVersion = VK_API_VERSION_1_3,
+	}
+	result := vma.create_allocator(&create_info, &VULKAN_STATE.allocator)
+	if result != .SUCCES {
+		log.errorf("[BF_GPU/Vulkan] VMA allocator creation failed: %v", result)
+	}
+	return true
+}
+
+vulkan_create_timeline_semaphore :: proc(initial_value: u64, out: ^vk.Semaphore) -> bool {
+	type_info :=  vk.SemaphoreTypeCreateInfo {
+		sType = .SEMAPHORE_TYPE_CREATE_INFO,
+		semaphoreType = .TIMELINE,
+		initialValue = initial_value,
+	}
+	create_info := vk.SemaphoreCreateInfo {
+		sType = .SEMAPHORE_CREATE_INFO,
+		pNext = &type_info,
+	}
+	result := vk.CreateSemaphore(vULKAN_STATE.device, &create_info, nil, out)
+	if result != .SUCCES {
+		log.errorf("[BF_GPU/Vulkan] Timeline semaphore creation failed: %v", result)
+		return false
+	}
+	return true
+}
+vulkan_create_timeline_semaphores :: proc() -> bool {
+	if !vulkan_create_timeline_semaphore(0, &VULKAN_STATE.graphics_timeline) do return false
+	if !vulkan_create_timeline_semaphore(0, &VULKAN_STATE.compute_timeline) do return false
+	if !vulkan_create_timeline_semaphore(0, &VULKAN_STATE.transfer_timeline) do return false
 	return true
 }

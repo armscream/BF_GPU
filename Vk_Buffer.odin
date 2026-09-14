@@ -1,24 +1,22 @@
 package BF_GPU
 
-import vk "vendor:vulkan"
 import "core:log"
+import vk "vendor:vulkan"
 
 Vulkan_Buffer :: struct {
-	buffer:         vk.Buffer,
-	memory:         vk.DeviceMemory,
-	size:           vk.DeviceSize,
-	usage:          vk.BufferUsageFlags,
-	mapped:         rawptr,
-	device_address: u64,
+	buffer:      vk.Buffer,
+	memory:      vk.DeviceMemory,
+	size:        vk.DeviceSize,
+	defice_addr: vk.DeviceAddress,
 }
 Vulkan_Buffer_Store :: struct {
 	buffers: [Gpu_Buffer_Kind]Vulkan_Buffer,
 }
 Gpu_Buffer_Description :: struct {
-    initial_capacity: u64,
-    stride: u32,
-    usage: vk.BufferUsageFlags,
-    memory_properties: vk.MemoryPropertyFlags,
+	initial_capacity:  u64,
+	stride:            u32,
+	usage:             vk.BufferUsageFlags,
+	memory_properties: vk.MemoryPropertyFlags,
 }
 
 vulkan_create_buffer :: proc(
@@ -85,6 +83,6 @@ vulkan_create_renderer_buffers :: proc(
 			stride      = desc.stride,
 		}
 	}
-    refresh_frame_addresses(frame)
-    return true
+	refresh_frame_addresses(frame)
+	return true
 }

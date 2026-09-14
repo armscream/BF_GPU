@@ -2,12 +2,6 @@
 //
 // Renderer-local matrix helpers.
 //
-// BF_Math owns the vector/matrix *types*; the renderer owns the handful of
-// operations it needs to turn ECS transforms and camera components into the
-// GPU-side matrices in Gpu_Types.odin. Keeping them here avoids growing a
-// general math library before the engine needs one, and keeps the conventions
-// documented in exactly one place:
-//
 //   * Mat4 is [16]f32, column-major: element (row r, column c) is m[c * 4 + r].
 //   * Mat3 is [9]f32, column-major: element (row r, column c) is n[c * 3 + r].
 //   * Projections are right-handed, looking down -Z, with clip depth in [0, 1]
@@ -18,6 +12,7 @@ package BF_GPU
 
 import mth "../../Core/BF_Math"
 import "core:math"
+//import "core:math/linalg"
 
 MAT4_IDENTITY :: mth.Mat4{1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1}
 MAT3_IDENTITY :: [9]f32{1, 0, 0, 0, 1, 0, 0, 0, 1}
