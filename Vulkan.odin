@@ -7,6 +7,7 @@ import vk "vendor:vulkan"
 
 //* EXT/CAPABILITIES listing.
 BF_GPU_DEVICE_EXTENSION_COUNT :: 5
+BF_GPU_VULKAN_API_VERSION :: vk.API_VERSION_1_3
 
 BF_GPU_DEVICE_EXTENSIONS: [BF_GPU_DEVICE_EXTENSION_COUNT]cstring = {
 	"VK_EXT_graphics_pipeline_library",
@@ -14,37 +15,6 @@ BF_GPU_DEVICE_EXTENSIONS: [BF_GPU_DEVICE_EXTENSION_COUNT]cstring = {
 	"VK_EXT_memory_budget",
 	"VK_KHR_fragment_shading_rate",
 	"VK_EXT_descriptor_buffer",
-}
-
-Vulkan_Capabilities :: struct {
-	api_version:                                  u32,
-
-	// Core / Vulkan 1.3
-	dynamic_rendering:                            bool,
-	synchronization2:                             bool,
-
-	// Vulkan 1.2
-	buffer_device_address:                        bool,
-	descriptor_indexing:                          bool,
-	runtime_descriptor_array:                     bool,
-	descriptor_binding_partially_bound:           bool,
-	descriptor_binding_variable_descriptor_count: bool,
-	draw_indirect_count:                          bool,
-
-	// Required BF_GPU extensions
-	graphics_pipeline_library:                    bool,
-	memory_priority:                              bool,
-	memory_budget:                                bool,
-	fragment_shading_rate:                        bool,
-	descriptor_buffer:                            bool,
-
-	// Extension features
-	pipeline_fragment_shading_rate:               bool,
-	primitive_fragment_shading_rate:              bool,
-	attachment_fragment_shading_rate:             bool,
-	descriptor_buffer_feature:                    bool,
-	descriptor_buffer_push_descriptors:           bool,
-	descriptor_buffer_capture_replay:             bool,
 }
 /////////////////////////////////////////////////
 
@@ -81,12 +51,10 @@ Vulkan_Swapchain :: struct {
 
 Vulkan_Context :: struct {
 	instance:                vk.Instance,
-	//
 	physical_device:         vk.PhysicalDevice,
 	device:                  vk.Device,
 	//
 	queues:                  Vulkan_Queue_Family,
-	capabilities:            Vulkan_Capabilities,
 	//
 	graphics_queue:          vk.Queue,
 	compute_queue:           vk.Queue,
@@ -216,12 +184,11 @@ vulkan_device_is_suitable :: proc(device: vk.PhysicalDevice) -> bool {
 	if !queues.has_compute do return false
 	if !queues.has_transfer do return false
 
-	caps, ok := vulkan_query_capabilities(device)
-	if !ok do return false
+	if !vulkan_check_required_extensions(device) do return false
+	if !vulkan_check_required_features(device) do return false
 
 	// if !vulkan_check_device_extensions(device) do return false
 	VULKAN_STATE.queues = queues
-	VULKAN_STATE.capabilities = caps
 	return true
 }
 
@@ -241,23 +208,70 @@ vulkan_enumerate_device_extensions :: proc(device: vk.PhysicalDevice) -> ([dynam
 	for property in properties {append(&names, property.extensionName)}
 	return names, true
 }
-vulkan_has_device_extension :: proc(extensions: []cstring, name: cstring) -> bool {
-	for extension in extensions {if extension == name do return true}
+vulkan_has_device_extension :: proc(device: vk.PhysicalDevice, required: cstring) -> bool {
+	count: u32
+	result: vk.EnumerateDeviceExtensionProperties(device, nil, &count, nil)
+	if result != .SUCCESS || count == 0 do return false
+
+	properties: make([]vk.ExtensionProperties, count)
+	defer delete(properties)
+
+	result = vk.EnumerateDeviceExtensionProperties(device, nil, &count, raw_data(properties))
+	if result != .SUCCESS do return false
+	
+	for property in properties {
+		if extension_name_equal(property.extensionName, required)do return true
+	}
 	return false
 }
 vulkan_check_required_extensions :: proc(device: vk.PhysicalDevice) -> bool {
-	extensions, ok := vulkan_enumerate_device_extensions(device)
-	if !ok {
-		log.error("[BF_GPU/Vulkan] Failed to enumerate device extensions.")
+	for extension in BF_GPU_DEVICE_EXTENSIONS {
+		if !vulkan_has_device_extension(device, extension) {
+			log.errorf("[BF_GPU/Vulkan] Missing required device extension: %s", extension)
+		}
+	}
+	return true
+}
+vulkan_check_required_features :: proc(device: vk.PhysicalDevice) -> bool {
+	features13 := vk.PhysicalDeviceVulkan13Features{
+		sType = .PHYSICAL_DEVICE_VULKAN_1_3_FEATURES
+	}
+	features12 := vk.PhysicalDeviceVulkan12Features{
+		sType = .PHYSICAL_DEVICE_VULKAN_1_2_FEATURES,
+		pNext = &features13
+	}
+	features2 := vk.PhysicalDeviceFeatures2{
+		sType = .PHYSICAL_DEVICE_FEATURES_2,
+		pNext = &features12
+	}
+	vk.GetPhysicaldevicefeatures2(device, &features2)
+	if !features13.dynamicRendering {
+		log.error("[BF_GPU/Vulkan] Dynamic rendering is required but not supported")
 		return false
 	}
-	defer delete(extensions)
-
-	for required in BF_GPU_DEVICE_EXTENSIONS {
-		if !vulkan_has_device_extension(extensions, required) {
-			log.error("[BF_GPU/Vulkan] Required device extension '{}' is not available.", required)
-			return false
-		}
+	if !features13.synchronization2  {
+		log.error("[BF_GPU/Vulkan] Synchronization2 is required but not supported")
+		return false
+	}
+	if !features12.bufferDeviceAddress {
+		log.error("[BF_GPU/Vulkan] Buffer device address is required but not supported")
+		return false
+	}
+	if !features12.descriptorIndexing { 
+		log.error("[BF_GPU/Vulkan] Descriptor indexing is required but not supported")
+		return false
+	}
+	if !features12.runtimeDescriptorArray  { 
+		log.error("[BF_GPU/Vulkan] Runtime descriptor array is required but not supported")
+		return false
+	}
+	if !features12.descriptorBindingVariableDescriptorCount {
+		log.error("[BF_GPU/Vulkan] Descriptor binding variable descriptor count is required but not supported")
+		return false
+	}
+	if !features12.drawIndirectCount {
+		log.error("[BF_GPU/Vulkan] Draw indirect count is required but not supported")
+		return false
 	}
 	return true
 }
