@@ -2,6 +2,7 @@ package BF_GPU
 
 import vma "../../dependencies/odin-vma"
 import "core:log"
+import "core:strings"
 import sdl "vendor:sdl3"
 import vk "vendor:vulkan"
 
@@ -92,7 +93,7 @@ vulkan_init :: proc() -> bool {
 	if !vulkan_create_device() do return false
 	if !vulkan_create_allocator() do return false
 	if !vulkan_create_command_resources() do return false
-	if !vulkan_create_swapchain() do return false // TODO: create swapchain, and make it recreate after resize
+	// TODO: create swapchain, and make it recreate after resize
 	if !vulkan_create_sync_objects() do return false
 	VULKAN_STATE.initialized = true
 	log.info("[BF_GPU/Vulkan] Vulkan backend initialized")
@@ -101,23 +102,34 @@ vulkan_init :: proc() -> bool {
 
 vulkan_shutdown :: proc() {
 	if !VULKAN_STATE.initialized && VULKAN_STATE.device == nil do return
-	vk.DeviceWaitIdle(VULKAN_STATE.device)
+	if VULKAN_STATE.device != nil{vk.DeviceWaitIdle(VULKAN_STATE.device)}
+
 	for i in 0 ..< MAX_FRAMES_IN_FLIGHT {
 		frame := &VULKAN_STATE.frames[i]
 		if frame.image_available !=
-		   nil {vk.DestroySemaphore(VULKAN_STATE.device, frame.image_available, nil)}
+		   cast(vk.Semaphore)0 {vk.DestroySemaphore(VULKAN_STATE.device, frame.image_available, nil)}
 		if frame.render_finished !=
-		   nil {vk.DestroySemaphore(VULKAN_STATE.device, frame.render_finished, nil)}
-		if frame.fence != nil {vk.DestroyFence(VULKAN_STATE.device, frame.fence, nil)}
+		   cast(vk.Semaphore)0 {vk.DestroySemaphore(VULKAN_STATE.device, frame.render_finished, nil)}
 		if frame.command_pool !=
-		   nil {vk.DestroyCommandPool(VULKAN_STATE.device, frame.command_pool, nil)}
+		   cast(vk.CommandPool)0 {vk.DestroyCommandPool(VULKAN_STATE.device, frame.command_pool, nil)}
 	}
-	vk.DestroyDevice(VULKAN_STATE.device, nil)
+	if VULKAN_STATE.graphics_timeline != cast(vk.Semaphore)0 {
+		vk.DestroySemaphore(VULKAN_STATE.device, VULKAN_STATE.graphics_timeline, nil)
+	}
+	if VULKAN_STATE.compute_timeline != cast(vk.Semaphore)0 {
+		vk.DestroySemaphore(VULKAN_STATE.device, VULKAN_STATE.compute_timeline, nil)
+	}
+	if VULKAN_STATE.transfer_timeline != cast(vk.Semaphore)0 {
+		vk.DestroySemaphore(VULKAN_STATE.device, VULKAN_STATE.transfer_timeline, nil)
+	}
+	if VULKAN_STATE.allocator != nil {
+		vma.DestroyAllocator(VULKAN_STATE.allocator)
+	}
+	if VULKAN_STATE.device != nil {vk.DestroyDevice(VULKAN_STATE.device, nil)}
 	if VULKAN_STATE.surface !=
-	   nil {vk.DestroySurfaceKHR(VULKAN_STATE.instance, VULKAN_STATE.surface, nil)}
+	   cast(vk.SurfaceKHR)0 {vk.DestroySurfaceKHR(VULKAN_STATE.instance, VULKAN_STATE.surface, nil)}
 	if VULKAN_STATE.instance != nil {vk.DestroyInstance(VULKAN_STATE.instance, nil)}
-	// Destroy VMA
-	vma.DestroyAllocator(allocator)
+	
 	VULKAN_STATE = {}
 }
 /////////////////////////////////////////////////////////////////////////
@@ -193,7 +205,7 @@ vulkan_device_is_suitable :: proc(device: vk.PhysicalDevice) -> bool {
 }
 
 //* EXTENSIONS
-vulkan_enumerate_device_extensions :: proc(device: vk.PhysicalDevice) -> ([dynamic]cstring, bool) {
+vulkan_enumerate_device_extensions :: proc(device: vk.PhysicalDevice) -> ([dynamic]string, bool) {
 	count: u32
 	result := vk.EnumerateDeviceExtensionProperties(device, nil, &count, nil)
 	if result != .SUCCESS || count == 0 do return nil, false
@@ -203,53 +215,67 @@ vulkan_enumerate_device_extensions :: proc(device: vk.PhysicalDevice) -> ([dynam
 	result = vk.EnumerateDeviceExtensionProperties(device, nil, &count, raw_data(properties))
 	if result != .SUCCESS do return nil, false
 
-	names: [dynamic]cstring
+	names: [dynamic]string
 
-	for property in properties {append(&names, property.extensionName)}
+	for i in 0 ..< len(properties) {
+		cstr := cstring(raw_data(properties[i].extensionName[:]))
+		append(&names, strings.clone(string(cstr)))
+	}
 	return names, true
 }
 vulkan_has_device_extension :: proc(device: vk.PhysicalDevice, required: cstring) -> bool {
 	count: u32
-	result: vk.EnumerateDeviceExtensionProperties(device, nil, &count, nil)
+	result := vk.EnumerateDeviceExtensionProperties(device, nil, &count, nil)
 	if result != .SUCCESS || count == 0 do return false
 
-	properties: make([]vk.ExtensionProperties, count)
+	properties := make([]vk.ExtensionProperties, count)
 	defer delete(properties)
 
 	result = vk.EnumerateDeviceExtensionProperties(device, nil, &count, raw_data(properties))
 	if result != .SUCCESS do return false
-	
-	for property in properties {
-		if extension_name_equal(property.extensionName, required)do return true
+
+	for i in 0 ..< len(properties) {
+		if extension_name_equal(properties[i].extensionName[:], required) do return true
 	}
 	return false
+}
+
+extension_name_equal :: proc(name: []byte, other: cstring) -> bool {
+	a := name
+	b := string(other)
+	if len(b) > len(a) do return false
+	for i in 0 ..< len(b) {
+		if a[i] != b[i] do return false
+	}
+	return a[len(b)] == 0
 }
 vulkan_check_required_extensions :: proc(device: vk.PhysicalDevice) -> bool {
 	for extension in BF_GPU_DEVICE_EXTENSIONS {
 		if !vulkan_has_device_extension(device, extension) {
 			log.errorf("[BF_GPU/Vulkan] Missing required device extension: %s", extension)
+			return false
 		}
 	}
 	return true
 }
 vulkan_check_required_features :: proc(device: vk.PhysicalDevice) -> bool {
-	features13 := vk.PhysicalDeviceVulkan13Features{
-		sType = .PHYSICAL_DEVICE_VULKAN_1_3_FEATURES
+	features13 := vk.PhysicalDeviceVulkan13Features {
+		sType = .PHYSICAL_DEVICE_VULKAN_1_3_FEATURES,
 	}
-	features12 := vk.PhysicalDeviceVulkan12Features{
+	features12 := vk.PhysicalDeviceVulkan12Features {
 		sType = .PHYSICAL_DEVICE_VULKAN_1_2_FEATURES,
-		pNext = &features13
+		pNext = &features13,
 	}
-	features2 := vk.PhysicalDeviceFeatures2{
+	features2 := vk.PhysicalDeviceFeatures2 {
 		sType = .PHYSICAL_DEVICE_FEATURES_2,
-		pNext = &features12
+		pNext = &features12,
 	}
-	vk.GetPhysicaldevicefeatures2(device, &features2)
+	vk.GetPhysicalDeviceFeatures2(device, &features2)
 	if !features13.dynamicRendering {
 		log.error("[BF_GPU/Vulkan] Dynamic rendering is required but not supported")
 		return false
 	}
-	if !features13.synchronization2  {
+	if !features13.synchronization2 {
 		log.error("[BF_GPU/Vulkan] Synchronization2 is required but not supported")
 		return false
 	}
@@ -257,16 +283,18 @@ vulkan_check_required_features :: proc(device: vk.PhysicalDevice) -> bool {
 		log.error("[BF_GPU/Vulkan] Buffer device address is required but not supported")
 		return false
 	}
-	if !features12.descriptorIndexing { 
+	if !features12.descriptorIndexing {
 		log.error("[BF_GPU/Vulkan] Descriptor indexing is required but not supported")
 		return false
 	}
-	if !features12.runtimeDescriptorArray  { 
+	if !features12.runtimeDescriptorArray {
 		log.error("[BF_GPU/Vulkan] Runtime descriptor array is required but not supported")
 		return false
 	}
 	if !features12.descriptorBindingVariableDescriptorCount {
-		log.error("[BF_GPU/Vulkan] Descriptor binding variable descriptor count is required but not supported")
+		log.error(
+			"[BF_GPU/Vulkan] Descriptor binding variable descriptor count is required but not supported",
+		)
 		return false
 	}
 	if !features12.drawIndirectCount {
@@ -289,7 +317,7 @@ vulkan_find_queue_families :: proc(device: vk.PhysicalDevice) -> Vulkan_Queue_Fa
 
 	// First pass: prefer dedicated compute/transfer families.
 
-	for i, props in properties {
+	for props, i in properties {
 		family := u32(i)
 
 		has_graphics := .GRAPHICS in props.queueFlags
@@ -307,7 +335,7 @@ vulkan_find_queue_families :: proc(device: vk.PhysicalDevice) -> Vulkan_Queue_Fa
 	}
 
 	// Second pass: fill general-purpose queues.
-	for i, props in properties {
+	for props, i in properties {
 		family := u32(i)
 		if .GRAPHICS in props.queueFlags {
 			if !result.has_graphics {
@@ -334,92 +362,15 @@ vulkan_find_queue_families :: proc(device: vk.PhysicalDevice) -> Vulkan_Queue_Fa
 }
 
 //* Physical Device
-vulkan_query_capabilities :: proc(device: vk.PhysicalDevice) -> (Vulkan_Capabilites, bool) {
-	caps := Vulkan_Capabilites{}
-	properties := vk.PhysicalDeviceProperties
-	vk.GetPhysicalDeviceProperties(device, &properties)
-	caps.api_version = properties.apiVersion
-
-	if caps.api_version < vk.API_VERSION_1_3 {
-		log.error("[BF_GPU/Vulkan] Vulkan 1.3 is required")
-		return caps, false
-	}
-	if !vulkan_check_required_extensions(device) do return caps, false
-
-	features13 := vk.PhysicalDeviceVulkan13Features {
-		sType = .PHYSICAL_DEVICE_VULKAN_1_3_FEATURES,
-	}
-	features12 := vk.PhysicalDeviceVulkan12Features {
-		sType = .PHYSICAL_DEVICE_VULKAN_1_2_FEATURES,
-		pNext = &features13,
-	}
-	features2 := vk.PhysicalDeviceFeatures2 {
-		sType = .PHYSICAL_DEVICE_FEATURES_2,
-		pNext = &features12,
-	}
-
-	vk.GetPhysicalDeviceFeatures2(device, &features2)
-
-	caps.dynamic_rendering = features13.dynamicRendering
-	caps.synchronization2 = features13.synchronization2
-
-	caps.buffer_device_address = features12.bufferDeviceAddress
-	caps.descriptor_indexing = features12.descriptorIndexing
-	caps.runtime_descriptor_array = features12.runtimeDescriptorArray
-	caps.descriptor_binding_partially_bound = features12.descriptorBindingPartiallyBound
-	caps.descriptor_binding_variable_descriptor_count =
-		features12.descriptorBindingVariableDescriptorCount
-	caps.drawIndirectCount = features12.drawIndirectCount
-
-	graphics_pipeline_library_features := VkPhysicalDeviceGraphicsPipelineLibraryFeaturesEXT {
-		sType                   = .PHYSICAL_DEVICE_GRAPHICS_PIPELINE_LIBRARY_FEATURES_EXT,
-		pNext                   = nil,
-		graphicsPipelineLibrary = true,
-	}
-
-	memory_priority_features := VkPhysicalDeviceMemoryPriorityFeaturesEXT {
-		sType          = .PHYSICAL_DEVICE_MEMORY_PRIORITY_FEATURES_EXT,
-		pNext          = nil,
-		memoryPriority = true,
-	}
-
-	fragment_shading_rate_features := VkPhysicalDeviceFragmentShadingRateFeaturesKHR {
-		sType                         = .PHYSICAL_DEVICE_FRAGMENT_SHADING_RATE_FEATURES_KHR,
-		pNext                         = nil,
-		attachmentFragmentShadingRate = true,
-		pipelineFragmentShadingRate   = true,
-	}
-
-	descriptor_buffer_features := VkPhysicalDeviceDescriptorBufferFeaturesEXT {
-		sType                              = .PHYSICAL_DEVICE_DESCRIPTOR_BUFFER_FEATURES_EXT,
-		pNext                              = nil,
-		descriptorBuffer                   = true,
-		descriptorBufferCaptureReplay      = true,
-		descriptorBufferImageLayoutIgnored = true,
-	}
-	return caps, true
-}
 vulkan_create_device :: proc() -> bool {
 	queues := VULKAN_STATE.queues
 	priority: f32 = 1.0
 	queue_infos: [dynamic]vk.DeviceQueueCreateInfo
-	append_queue := proc(family: u32) {
-		for info in queue_infos {if info.queueFamilyIndex == family do return}
-		append(
-			&queue_infos,
-			vk.DeviceQueueCreateInfo {
-				sType = .DEVICE_QUEUE_CREATE_INFO,
-				queueFamilyIndex = family,
-				queueCount = 1,
-				pQueuePriorities = &priority,
-			},
-		)
-	}
 
-	append_queue(queues.graphics)
-	append_queue(queues.compute)
-	append_queue(queues.transfer)
-	append_queue(queues.present)
+	vulkan_append_unique_queue_family(&queue_infos, queues.graphics, &priority)
+	vulkan_append_unique_queue_family(&queue_infos, queues.compute, &priority)
+	vulkan_append_unique_queue_family(&queue_infos, queues.transfer, &priority)
+	vulkan_append_unique_queue_family(&queue_infos, queues.present, &priority)
 
 	features13 := vk.PhysicalDeviceVulkan13Features {
 		sType            = .PHYSICAL_DEVICE_VULKAN_1_3_FEATURES,
@@ -442,8 +393,8 @@ vulkan_create_device :: proc() -> bool {
 		sType                   = .DEVICE_CREATE_INFO,
 		queueCreateInfoCount    = u32(len(queue_infos)),
 		pQueueCreateInfos       = raw_data(queue_infos),
-		enabledExtensionCount   = u32(len(device_extensions)),
-		ppEnabledExtensionNames = raw_data(device_extensions),
+		enabledExtensionCount   = u32(len(BF_GPU_DEVICE_EXTENSIONS)),
+		ppEnabledExtensionNames = &BF_GPU_DEVICE_EXTENSIONS[0],
 		pNext                   = &features12,
 	}
 
@@ -565,14 +516,15 @@ vulkan_create_allocator :: proc() -> bool {
 	create_info := vma.AllocatorCreateInfo {
 		flags            = {.BUFFER_DEVICE_ADDRESS},
 		instance         = VULKAN_STATE.instance,
-		physicalDevice  = VULKAN_STATE.physical_device,
+		physicalDevice   = VULKAN_STATE.physical_device,
 		device           = VULKAN_STATE.device,
 		pVulkanFunctions = &functions,
-		vulkanApiVersion = vk.API_VERSION_1_3,
+		vulkanApiVersion = BF_GPU_VULKAN_API_VERSION,
 	}
 	result := vma.CreateAllocator(create_info, &VULKAN_STATE.allocator)
 	if result != .SUCCESS {
 		log.errorf("[BF_GPU/Vulkan] VMA allocator creation failed: %v", result)
+		return false
 	}
 	return true
 }
@@ -587,8 +539,8 @@ vulkan_create_timeline_semaphore :: proc(initial_value: u64, out: ^vk.Semaphore)
 		sType = .SEMAPHORE_CREATE_INFO,
 		pNext = &type_info,
 	}
-	result := vk.CreateSemaphore(vULKAN_STATE.device, &create_info, nil, out)
-	if result != .SUCCES {
+	result := vk.CreateSemaphore(VULKAN_STATE.device, &create_info, nil, out)
+	if result != .SUCCESS {
 		log.errorf("[BF_GPU/Vulkan] Timeline semaphore creation failed: %v", result)
 		return false
 	}

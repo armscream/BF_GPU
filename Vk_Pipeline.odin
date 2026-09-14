@@ -2,6 +2,12 @@ package BF_GPU
 
 import vk "vendor:vulkan"
 
+Vulkan_Pipeline :: struct {
+    pipeline: vk.Pipeline,
+    layout:   vk.PipelineLayout,
+}
+
+/*
 GPU_Pass_Type :: enum {
     Compue,
     Graphics,
@@ -53,3 +59,4 @@ renderer_build_default_passes :: proc(r: ^Vulkan_Renderer){
         shader_path("Shading/Traditional.frag")
     )
 }
+*/
