@@ -20,6 +20,7 @@ Vulkan_Frame :: struct {
 }
 
 vulkan_submit_graphics :: proc(frame: ^Vulkan_Frame) -> bool {
+    // Q successful graphics submission gets a unique completion value.
 	VULKAN_STATE.graphics_timeline_value += 1
 	signal_value := VULKAN_STATE.graphics_timeline_value
 
@@ -27,10 +28,12 @@ vulkan_submit_graphics :: proc(frame: ^Vulkan_Frame) -> bool {
 	wait_stage := vk.PipelineStageFlags{vk.PipelineStageFlag.COLOR_ATTACHMENT_OUTPUT}
 	wait_stages := [1]vk.PipelineStageFlags{wait_stage}
 	signal_semaphores := [2]vk.Semaphore{frame.render_finished, VULKAN_STATE.graphics_timeline}
-	signal_values := [2]u64{0, signal_value}
+	
 	command_buffers := [1]vk.CommandBuffer{frame.command_buffer}
 
 	wait_values := [1]u64{0}
+    signal_values := [2]u64{0, signal_value}
+
 	timeline_info := vk.TimelineSemaphoreSubmitInfo {
 		sType                     = .TIMELINE_SEMAPHORE_SUBMIT_INFO,
 		waitSemaphoreValueCount   = 1,
@@ -105,13 +108,12 @@ vulkan_frame :: proc() -> bool {
 	// reused until its previous graphics submission completed.
 	if !vulkan_wait_graphics_timeline(frame.completion_value) do return false
 
-	if window_resize_pending() { if !vulkan_recreate_swapchain() do return false }
+	if window_resize_pending() {return vulkan_recreate_swapchain()}
 
 	image_index, acquire_result := vulkan_acquire_next_image(frame)
-	if acquire_result == .ERROR_OUT_OF_DATE_KHR { 
-        if !vulkan_recreate_swapchain() { return false } 
-        return true
-    }
+	if acquire_result == .ERROR_OUT_OF_DATE_KHR {
+		return vulkan_recreate_swapchain()
+	}
 
 	if acquire_result != .SUCCESS && acquire_result != .SUBOPTIMAL_KHR {
 		log.errorf("[BF_GPU/Vulkan] vkAckuireNextImageKHR failed: %v", acquire_result)
@@ -120,7 +122,7 @@ vulkan_frame :: proc() -> bool {
 
 	if !vulkan_begin_command_buffer(frame.command_buffer) do return false
 
-    ///
+	///
 	//** Rendering swill be inserted HERE **//
 	///
 
@@ -128,15 +130,38 @@ vulkan_frame :: proc() -> bool {
 	if !vulkan_submit_graphics(frame) do return false
 
 	present_result := vulkan_present(frame, image_index)
-	if present_result == .ERROR_OUT_OF_DATE_KHR ||
-	   present_result == .SUBOPTIMAL_KHR {
-        if !vulkan_recreate_swapchain() do return false
-    } else if present_result != .SUCCESS {
-        log.errorf("[BF_GPU/Vulkan] vQueuePresentKHR failed: %v", present_result)
+	if present_result == .ERROR_OUT_OF_DATE_KHR || present_result == .SUBOPTIMAL_KHR {
+		if !vulkan_recreate_swapchain() do return false
+	} else if present_result != .SUCCESS {
+		log.errorf("[BF_GPU/Vulkan] vQueuePresentKHR failed: %v", present_result)
 		return false
 	}
 
 	VULKAN_STATE.frame_index = (VULKAN_STATE.frame_index + 1) % MAX_FRAMES_IN_FLIGHT
 	//TODO: there is currently no CPU-side frame completion wait.
 	return true
+}
+
+vulkan_wait_graphics_timeline :: proc(value: u64) -> bool {
+	if value == 0 do return true
+
+	semaphores := [1]vk.Semaphore{VULKAN_STATE.graphics_timeline}
+	values := [1]u64{value}
+	wait_info := vk.SemaphoreWaitInfo {
+		sType          = .SEMAPHORE_CREATE_INFO,
+		semaphoreCount = 1,
+		pSemaphores    = &semaphores[0],
+		pValues        = &values[0],
+	}
+
+    result := vk.WaitSemaphores (
+        VULKAN_STATE.device,
+        &wait_info,
+        0xFFFFFFFFFFFFFFFF,
+    )
+    if result != .SUCCESS {
+        log.errorf("[BF_GPU/Vulkan] vkWaitSemaphores failed: &v", result)
+        return false
+    }
+    return true
 }

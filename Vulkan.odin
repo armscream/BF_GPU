@@ -580,28 +580,6 @@ vulkan_acquire_next_image :: proc(frame: ^Vulkan_Frame) -> (u32, vk.Result) {
 	)
 	return image_index, result
 }
-vulkan_wait_graphics_timeline :: proc(value: u64) -> bool {
-	if value == 0 do return true
-	semaphore := [1]vk.Semaphore {VULKAN_STATE.graphics_timeline}
-	values := [1]u64 {value}
-	wait_info := vk.SemaphoreWaitInfo {
-		sType = .SEMAPHORE_WAIT_INFO,
-		semaphoreCount = 1,
-		pSemaphores = &semaphore[0],
-		pValues = &values[0],
-	}
-
-	result := vk.WaitSemaphores(
-		VULKAN_STATE.device,
-		&wait_info,
-		0xFFFFFFFFFFFFFFFF,
-	)
-	if result != .SUCCESS {
-		log.errorf("[BF_GPU/Vulkan] vkWaitSemaphores failed: %v", result)
-		return false
-	}
-	return true
-}
 //* =====================================================================
 
 vulkan_find_queue_families :: proc(device: vk.PhysicalDevice) -> Vulkan_Queue_Family {
