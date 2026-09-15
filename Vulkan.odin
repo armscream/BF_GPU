@@ -31,15 +31,6 @@ Vulkan_Queue_Family :: struct {
 	has_present:  bool,
 }
 
-Vulkan_Frame :: struct {
-	command_pool:    vk.CommandPool,
-	command_buffer:  vk.CommandBuffer,
-	//
-	// WSI synchronization
-	image_available: vk.Semaphore,
-	render_finished: vk.Semaphore,
-}
-
 //* SWAPCHAIN
 Vulkan_Swapchain :: struct {
 	handle:      vk.SwapchainKHR,
@@ -510,7 +501,7 @@ vulkan_create_swapchain :: proc() -> bool {
 
 	VULKAN_STATE.swapchain.image_count = image_count
 	log.infof(
-		"[BF_GPU/Vulkan] Swapchain created: %d%d, images=%d",
+		"[BF_GPU/Vulkan] Swapchain created: %dx%d, images=%d",
 		extent.width,
 		extent.height,
 		image_count
@@ -588,6 +579,28 @@ vulkan_acquire_next_image :: proc(frame: ^Vulkan_Frame) -> (u32, vk.Result) {
 		&image_index,
 	)
 	return image_index, result
+}
+vulkan_wait_graphics_timeline :: proc(value: u64) -> bool {
+	if value == 0 do return true
+	semaphore := [1]vk.Semaphore {VULKAN_STATE.graphics_timeline}
+	values := [1]u64 {value}
+	wait_info := vk.SemaphoreWaitInfo {
+		sType = .SEMAPHORE_WAIT_INFO,
+		semaphoreCount = 1,
+		pSemaphores = &semaphore[0],
+		pValues = &values[0],
+	}
+
+	result := vk.WaitSemaphores(
+		VULKAN_STATE.device,
+		&wait_info,
+		0xFFFFFFFFFFFFFFFF,
+	)
+	if result != .SUCCESS {
+		log.errorf("[BF_GPU/Vulkan] vkWaitSemaphores failed: %v", result)
+		return false
+	}
+	return true
 }
 //* =====================================================================
 

@@ -103,7 +103,6 @@ vulkan_begin_command_buffer :: proc(cmd_buffer: vk.CommandBuffer) -> bool {
 	}
 	begin_info := vk.CommandBufferBeginInfo {
 		sType = .COMMAND_BUFFER_BEGIN_INFO,
-		flags = {},
 	}
 	result = vk.BeginCommandBuffer(cmd_buffer, &begin_info)
 	if result != .SUCCESS {
