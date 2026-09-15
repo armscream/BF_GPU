@@ -33,12 +33,13 @@ Vulkan_Queue_Family :: struct {
 
 //* SWAPCHAIN
 Vulkan_Swapchain :: struct {
-	handle:      vk.SwapchainKHR,
-	format:      vk.Format,
-	extent:      vk.Extent2D,
-	images:      []vk.Image,
-	image_views: []vk.ImageView,
-	image_count: u32,
+	handle:        vk.SwapchainKHR,
+	format:        vk.Format,
+	extent:        vk.Extent2D,
+	images:        []vk.Image,
+	image_views:   []vk.ImageView,
+	image_layouts: []vk.ImageLayout,
+	image_count:   u32,
 }
 
 Vulkan_Context :: struct {
@@ -432,6 +433,12 @@ vulkan_create_swapchain :: proc() -> bool {
 	if capabilities.maxImageCount > 0 && image_count > capabilities.maxImageCount {
 		image_count = capabilities.maxImageCount}
 
+	VULKAN_STATE.swapchain.image_layouts = make([]vk.ImageLayout, image_count)
+
+	for i in 0 ..< image_count {
+		VULKAN_STATE.swapchain.image_layouts[i] = .UNDEFINED
+	}
+
 	queue_indices := [2]u32{VULKAN_STATE.queues.graphics, VULKAN_STATE.queues.present}
 
 	create_info := vk.SwapchainCreateInfoKHR {
@@ -504,7 +511,7 @@ vulkan_create_swapchain :: proc() -> bool {
 		"[BF_GPU/Vulkan] Swapchain created: %dx%d, images=%d",
 		extent.width,
 		extent.height,
-		image_count
+		image_count,
 	)
 
 	return true
@@ -541,7 +548,7 @@ vulkan_create_swapchain_image_views :: proc() -> bool {
 		)
 		if result != .SUCCESS {
 			log.errorf("[BF_GPU/Vulkan] vkCreateImageView for swapchain image %d: %v", i, result)
-			for j in 0..< i {
+			for j in 0 ..< i {
 				vk.DestroyImageView(VULKAN_STATE.device, swapchain.image_views[j], nil)
 			}
 			delete(swapchain.image_views)
