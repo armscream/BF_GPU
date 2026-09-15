@@ -507,6 +507,12 @@ vulkan_create_swapchain :: proc() -> bool {
 	}
 
 	VULKAN_STATE.swapchain.image_count = image_count
+	VULKAN_STATE.swapchain.image_layouts = make([]vk.ImageLayout, image_count)
+
+	for i in 0 ..< image_count {
+		VULKAN_STATE.swapchain.image_layouts[i] = .UNDEFINED
+	}
+
 	log.infof(
 		"[BF_GPU/Vulkan] Swapchain created: %dx%d, images=%d",
 		extent.width,
@@ -568,10 +574,17 @@ vulkan_destroy_swapchain :: proc() {
 	delete(swapchain.image_views)
 	swapchain.image_views = nil
 
+	delete(swapchain.images)
+	swapchain.images = nil
+
+	delete(swapchain.image_layouts)
+	swapchain.image_layouts = nil
+
 	if swapchain.handle != {} {
 		vk.DestroySwapchainKHR(VULKAN_STATE.device, swapchain.handle, nil)
 		swapchain.handle = {}
 	}
+
 	swapchain^ = {}
 }
 //* SWAPCHAIN RUNTIME

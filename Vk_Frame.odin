@@ -59,7 +59,7 @@ vulkan_frame :: proc() -> bool {
 
 	return true
 }
-
+//* ///////////////////////////////////
 vulkan_submit_graphics :: proc(frame: ^Vulkan_Frame) -> bool {
 	// Q successful graphics submission gets a unique completion value.
 	VULKAN_STATE.graphics_timeline_value += 1
@@ -163,7 +163,7 @@ vulkan_transition_swapchain_image_to_attachment :: proc(
 	command_buffer: vk.CommandBuffer,
 	image_index: u32,
 ) {
-    swapchain := &VULKAN_STATE.swapchain
+	swapchain := &VULKAN_STATE.swapchain
 
 	barrier := vk.ImageMemoryBarrier2 {
 		sType = .IMAGE_MEMORY_BARRIER_2,
@@ -191,11 +191,10 @@ vulkan_transition_swapchain_image_to_attachment :: proc(
 		pImageMemoryBarriers    = &barrier,
 	}
 
-    swapchain.image_layouts[image_index] = .PRESENT_SRC_KHR
+	swapchain.image_layouts[image_index] = .PRESENT_SRC_KHR
 
 	vk.CmdPipelineBarrier2(command_buffer, &dependency_info)
 }
-
 vulkan_transition_swapchain_image_to_present :: proc(
 	command_buffer: vk.CommandBuffer,
 	image: vk.Image,
@@ -228,12 +227,46 @@ vulkan_transition_swapchain_image_to_present :: proc(
 
 	vk.CmdPipelineBarrier2(command_buffer, &dependency_info)
 }
-vulkan_record_swapchain_render :: proc(frame: ^Vulkan_Frame, image_index: u32) {
-	command_buffer := frame.command_buffer
-	image := VULKAN_STATE.swapchain.images[image_index]
-	image_view := VULKAN_STATE.swapchain.image_views[image_index]
+vulkan_transition_swapchain_image :: proc(
+	command_buffer: vk.CommandBuffer,
+	image_index: u32,
+	old_layout: vk.ImageLayout,
+	new_layout: vk.ImageLayout,
+) {
+	swapchain := &VULKAN_STATE.swapchain
 
-	vulkan_transition_swapchain_image_to_attachment(command_buffer, image_index)
+	barrier := vk.ImageMemoryBarrier2 {
+		sType = .IMAGE_MEMORY_BARRIER_2,
+		srcStageMask = {.TOP_OF_PIPE},
+		srcAccessMask = {},
+		dstStageMask = {.COLOR_ATTACHMENT_OUTPUT},
+		dstAccessMask = {.COLOR_ATTACHMENT_WRITE},
+		oldLayout = old_layout,
+		newLayout = new_layout,
+		srcQueueFamilyIndex = vk.QUEUE_FAMILY_IGNORED,
+		dstQueueFamilyIndex = vk.QUEUE_FAMILY_IGNORED,
+		image = swapchain.images[image_index],
+		subresourceRange = vk.ImageSubresourceRange {
+			aspectMask = {.COLOR},
+			baseMipLevel = 0,
+			levelCount = 1,
+			baseArrayLayer = 0,
+			layerCount = 1,
+		},
+	}
+
+	dependency_info := vk.DependencyInfo {
+		sType                   = .DEPENDENCY_INFO,
+		imageMemoryBarrierCount = 1,
+		pImageMemoryBarriers    = &barrier,
+	}
+
+	vk.CmdPipelineBarrier2(command_buffer, &dependency_info)
+}
+vulkan_record_swapchain_render :: proc(frame: ^Vulkan_Frame, image_index: u32) {
+	swapchain := &VULKAN_STATE.swapchain
+
+	vulkan_transition_to_color_attachment(frame.command_buffer, image_index)
 
 	clear_value := vk.ClearValue {
 		color = vk.ClearColorValue{float32 = [4]f32{0.025, 0.025, 0.035, 1.0}},
@@ -241,8 +274,8 @@ vulkan_record_swapchain_render :: proc(frame: ^Vulkan_Frame, image_index: u32) {
 
 	color_attachment := vk.RenderingAttachmentInfo {
 		sType       = .RENDERING_ATTACHMENT_INFO,
-		imageView   = image_view,
-		imageLayout = .ATTACHMENT_OPTIMAL,
+		imageView   = swapchain.image_views[image_index],
+		imageLayout = .COLOR_ATTACHMENT_OPTIMAL,
 		loadOp      = .CLEAR,
 		storeOp     = .STORE,
 		clearValue  = clear_value,
@@ -250,20 +283,85 @@ vulkan_record_swapchain_render :: proc(frame: ^Vulkan_Frame, image_index: u32) {
 
 	rendering_info := vk.RenderingInfo {
 		sType = .RENDERING_INFO,
-		renderArea = vk.Rect2D {
-			offset = vk.Offset2D{x = 0, y = 0},
-			extent = VULKAN_STATE.swapchain.extent,
-		},
+		renderArea = vk.Rect2D{offset = vk.Offset2D{x = 0, y = 0}, extent = swapchain.extent},
 		layerCount = 1,
 		colorAttachmentCount = 1,
 		pColorAttachments = &color_attachment,
 	}
 
-	vk.CmdBeginRendering(command_buffer, &rendering_info)
+	vk.CmdBeginRendering(frame.command_buffer, &rendering_info)
 
-	//TODO: No draw calls yet.
+	// No graphics pipeline yet.
+	// This establishes the dynamic-rendering scope.
 
-	vk.CmdEndRendering(command_buffer)
+	vk.CmdEndRendering(frame.command_buffer)
 
-	vulkan_transition_swapchain_image_to_present(command_buffer, image)
+	vulkan_transition_to_present(frame.command_buffer, image_index)
+}
+vulkan_transition_to_color_attachment :: proc(command_buffer: vk.CommandBuffer, image_index: u32) {
+	swapchain := &VULKAN_STATE.swapchain
+	old_layout := swapchain.image_layouts[image_index]
+
+	barrier := vk.ImageMemoryBarrier2 {
+		sType = .IMAGE_MEMORY_BARRIER_2,
+		srcStageMask = {},
+		srcAccessMask = {},
+		dstStageMask = {.COLOR_ATTACHMENT_OUTPUT},
+		dstAccessMask = {.COLOR_ATTACHMENT_WRITE},
+		oldLayout = old_layout,
+		newLayout = .COLOR_ATTACHMENT_OPTIMAL,
+		srcQueueFamilyIndex = vk.QUEUE_FAMILY_IGNORED,
+		dstQueueFamilyIndex = vk.QUEUE_FAMILY_IGNORED,
+		image = swapchain.images[image_index],
+		subresourceRange = vk.ImageSubresourceRange {
+			aspectMask = {.COLOR},
+			baseMipLevel = 0,
+			levelCount = 1,
+			baseArrayLayer = 0,
+			layerCount = 1,
+		},
+	}
+
+	dependency_info := vk.DependencyInfo {
+		sType                   = .DEPENDENCY_INFO,
+		imageMemoryBarrierCount = 1,
+		pImageMemoryBarriers    = &barrier,
+	}
+
+	vk.CmdPipelineBarrier2(command_buffer, &dependency_info)
+
+	swapchain.image_layouts[image_index] = .COLOR_ATTACHMENT_OPTIMAL
+}
+vulkan_transition_to_present :: proc(command_buffer: vk.CommandBuffer, image_index: u32) {
+	swapchain := &VULKAN_STATE.swapchain
+
+	barrier := vk.ImageMemoryBarrier2 {
+		sType = .IMAGE_MEMORY_BARRIER_2,
+		srcStageMask = {.COLOR_ATTACHMENT_OUTPUT},
+		srcAccessMask = {.COLOR_ATTACHMENT_WRITE},
+		dstStageMask = {},
+		dstAccessMask = {},
+		oldLayout = .COLOR_ATTACHMENT_OPTIMAL,
+		newLayout = .PRESENT_SRC_KHR,
+		srcQueueFamilyIndex = vk.QUEUE_FAMILY_IGNORED,
+		dstQueueFamilyIndex = vk.QUEUE_FAMILY_IGNORED,
+		image = swapchain.images[image_index],
+		subresourceRange = vk.ImageSubresourceRange {
+			aspectMask = {.COLOR},
+			baseMipLevel = 0,
+			levelCount = 1,
+			baseArrayLayer = 0,
+			layerCount = 1,
+		},
+	}
+
+	dependency_info := vk.DependencyInfo {
+		sType                   = .DEPENDENCY_INFO,
+		imageMemoryBarrierCount = 1,
+		pImageMemoryBarriers    = &barrier,
+	}
+
+	vk.CmdPipelineBarrier2(command_buffer, &dependency_info)
+
+	swapchain.image_layouts[image_index] = .PRESENT_SRC_KHR
 }
