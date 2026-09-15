@@ -63,6 +63,8 @@ Vulkan_Context :: struct {
 	present_queue:           vk.Queue,
 	//
 	surface:                 vk.SurfaceKHR,
+	//
+	swapchain:               Vulkan_Swapchain,
 	// Memory
 	allocator:               vma.Allocator,
 	// timeline
@@ -85,7 +87,7 @@ MAX_FRAMES_IN_FLIGHT :: 2
 VULKAN_STATE: Vulkan_Context
 
 //////////////////////////////////////////////////////////////////////////////////////
-//* LIFECYCLE CODE
+//* LIFECYCLE CODE ------------------------------------------------------
 vulkan_init :: proc() -> bool {
 	if !vulkan_create_instance() do return false
 	if !vulkan_create_surface() do return false
@@ -93,8 +95,10 @@ vulkan_init :: proc() -> bool {
 	if !vulkan_create_device() do return false
 	if !vulkan_create_allocator() do return false
 	if !vulkan_create_command_resources() do return false
-	// TODO: create swapchain, and make it recreate after resize
 	if !vulkan_create_sync_objects() do return false
+	if !vulkan_create_swapchain() do return false
+	if !vulkan_create_swapchain_image_views() do return false
+
 	VULKAN_STATE.initialized = true
 	log.info("[BF_GPU/Vulkan] Vulkan backend initialized")
 	return true
@@ -102,7 +106,9 @@ vulkan_init :: proc() -> bool {
 
 vulkan_shutdown :: proc() {
 	if !VULKAN_STATE.initialized && VULKAN_STATE.device == nil do return
-	if VULKAN_STATE.device != nil{vk.DeviceWaitIdle(VULKAN_STATE.device)}
+	if VULKAN_STATE.device != nil {vk.DeviceWaitIdle(VULKAN_STATE.device)}
+
+	vulkan_destroy_swapchain()
 
 	for i in 0 ..< MAX_FRAMES_IN_FLIGHT {
 		frame := &VULKAN_STATE.frames[i]
@@ -129,10 +135,10 @@ vulkan_shutdown :: proc() {
 	if VULKAN_STATE.surface !=
 	   cast(vk.SurfaceKHR)0 {vk.DestroySurfaceKHR(VULKAN_STATE.instance, VULKAN_STATE.surface, nil)}
 	if VULKAN_STATE.instance != nil {vk.DestroyInstance(VULKAN_STATE.instance, nil)}
-	
+
 	VULKAN_STATE = {}
 }
-/////////////////////////////////////////////////////////////////////////
+//* ---------------------------------------------------------------------
 
 vulkan_create_instance :: proc() -> bool {
 	app_info := vk.ApplicationInfo {
@@ -163,7 +169,7 @@ vulkan_create_instance :: proc() -> bool {
 	return true
 }
 
-//* PICK PHYSICAL DEVICE
+//* PICK PHYSICAL DEVICE 
 // prior to logical device creation
 vulkan_pick_physical_device :: proc() -> bool {
 	count: u32
@@ -188,7 +194,7 @@ vulkan_pick_physical_device :: proc() -> bool {
 	log.error("[BF_GPU/Vulkan] no suitable Vulkan device found")
 	return false
 }
-
+//* DEVICE QUERIES ========================================================
 vulkan_device_is_suitable :: proc(device: vk.PhysicalDevice) -> bool {
 	queues := vulkan_find_queue_families(device)
 	if !queues.has_graphics do return false
@@ -203,8 +209,6 @@ vulkan_device_is_suitable :: proc(device: vk.PhysicalDevice) -> bool {
 	VULKAN_STATE.queues = queues
 	return true
 }
-
-//* EXTENSIONS
 vulkan_enumerate_device_extensions :: proc(device: vk.PhysicalDevice) -> ([dynamic]string, bool) {
 	count: u32
 	result := vk.EnumerateDeviceExtensionProperties(device, nil, &count, nil)
@@ -239,7 +243,6 @@ vulkan_has_device_extension :: proc(device: vk.PhysicalDevice, required: cstring
 	}
 	return false
 }
-
 extension_name_equal :: proc(name: []byte, other: cstring) -> bool {
 	a := name
 	b := string(other)
@@ -303,7 +306,279 @@ vulkan_check_required_features :: proc(device: vk.PhysicalDevice) -> bool {
 	}
 	return true
 }
-////////////////////////////////////////////////////////
+//* =======================================================================
+
+//* SWAPCHAIN =============================================================
+vulkan_query_surface_capabilities :: proc(
+	device: vk.PhysicalDevice,
+) -> (
+	vk.SurfaceCapabilitiesKHR,
+	bool,
+) {
+	capabilities := vk.SurfaceCapabilitiesKHR{}
+	result := vk.GetPhysicalDeviceSurfaceCapabilitiesKHR(
+		device,
+		VULKAN_STATE.surface,
+		&capabilities,
+	)
+	if result != .SUCCESS {
+		log.error("[BF_GPU/Vulkan] vkGetPhysicalDeviceSurfaceCapabilitiesKHR failed: %v", result)
+		return capabilities, false
+	}
+	return capabilities, true
+}
+vulkan_query_surface_formats :: proc(device: vk.PhysicalDevice) -> ([]vk.SurfaceFormatKHR, bool) {
+	count: u32
+	result := vk.GetPhysicalDeviceSurfaceFormatsKHR(device, VULKAN_STATE.surface, &count, nil)
+	if result != .SUCCESS || count == 0 {
+		log.error("[BF_GPU/Vulkan] no surface formats available")
+		return nil, false
+	}
+
+	formats := make([]vk.SurfaceFormatKHR, count)
+	result = vk.GetPhysicalDeviceSurfaceFormatsKHR(
+		device,
+		VULKAN_STATE.surface,
+		&count,
+		raw_data(formats),
+	)
+
+	if result != .SUCCESS {
+		delete(formats)
+		log.errorf("[BF_GPU/Vulkan] failed querying surface formats: %v", result)
+		return nil, false
+	}
+
+	return formats, true
+}
+vulkan_query_present_modes :: proc(device: vk.PhysicalDevice) -> ([]vk.PresentModeKHR, bool) {
+	count: u32
+	result := vk.GetPhysicalDeviceSurfacePresentModesKHR(device, VULKAN_STATE.surface, &count, nil)
+	if result != .SUCCESS || count == 0 {
+		log.error("[BF_GPU/Vulkan] no present modes available")
+		return nil, false
+	}
+	modes := make([]vk.PresentModeKHR, count)
+
+	result = vk.GetPhysicalDeviceSurfacePresentModesKHR(
+		device,
+		VULKAN_STATE.surface,
+		&count,
+		raw_data(modes),
+	)
+	if result != .SUCCESS {
+		delete(modes)
+		log.errorf("[BF_GPU/Vulkan] failed querying present modes: %v", result)
+		return nil, false
+	}
+	return modes, true
+}
+vulkan_choose_surface_format :: proc(
+	formats: []vk.SurfaceFormatKHR,
+) -> (
+	vk.SurfaceFormatKHR,
+	bool,
+) {
+	for format in formats {
+		if format.format == .B8G8R8A8_SRGB &&
+		   format.colorSpace == .SRGB_NONLINEAR {return format, true}
+	}
+	// TODO: make swapchain format configurable via renderer settings
+	// Fall back to the first format supplied by the implementation.
+	if len(formats) > 0 {return formats[0], true}
+
+	return {}, false
+}
+vulkan_choose_present_mode :: proc(modes: []vk.PresentModeKHR) -> vk.PresentModeKHR {
+	for mode in modes {
+		if mode == .MAILBOX {return .MAILBOX}
+	}
+	// Mailbox if available, otherwise FIFO.
+	return .FIFO
+}
+vulkan_choose_swapchain_extent :: proc(
+	capabilities: vk.SurfaceCapabilitiesKHR,
+	window: Window_Handle,
+) -> vk.Extent2D {
+	if capabilities.currentExtent.width != 0xFFFFFFFF {
+		return capabilities.currentExtent}
+
+	width := window.width
+	height := window.height
+
+	if width < capabilities.minImageExtent.width {
+		width = capabilities.minImageExtent.width}
+	if width > capabilities.maxImageExtent.width {
+		width = capabilities.maxImageExtent.width}
+
+	if height < capabilities.minImageExtent.height {
+		height = capabilities.minImageExtent.height}
+	if height > capabilities.maxImageExtent.height {
+		height = capabilities.maxImageExtent.height}
+
+	return vk.Extent2D{width = width, height = height}
+}
+vulkan_create_swapchain :: proc() -> bool {
+	device := VULKAN_STATE.physical_device
+	capabilities, ok := vulkan_query_surface_capabilities(device)
+	if !ok do return false
+	formats, ok2 := vulkan_query_surface_formats(device)
+	if !ok2 do return false
+	present_modes, ok3 := vulkan_query_present_modes(device)
+	if !ok3 do return false
+	defer delete(present_modes)
+
+	surface_format, ok4 := vulkan_choose_surface_format(formats)
+	if !ok4 {
+		log.error("[BF_GPU/Vulkan] Failed to choose surface format")
+		return false
+	}
+	present_mode := vulkan_choose_present_mode(present_modes)
+	window := window_get_handle()
+	extent := vulkan_choose_swapchain_extent(capabilities, window)
+	image_count := capabilities.minImageCount + 1
+
+	if capabilities.maxImageCount > 0 && image_count > capabilities.maxImageCount {
+		image_count = capabilities.maxImageCount}
+
+	queue_indices := [2]u32{VULKAN_STATE.queues.graphics, VULKAN_STATE.queues.present}
+
+	create_info := vk.SwapchainCreateInfoKHR {
+		sType            = .SWAPCHAIN_CREATE_INFO_KHR,
+		surface          = VULKAN_STATE.surface,
+		minImageCount    = image_count,
+		imageFormat      = surface_format.format,
+		imageColorSpace  = surface_format.colorSpace,
+		imageExtent      = extent,
+		imageArrayLayers = 1,
+		imageUsage       = {.COLOR_ATTACHMENT},
+		preTransform     = capabilities.currentTransform,
+		compositeAlpha   = {.OPAQUE},
+		presentMode      = present_mode,
+		clipped          = true,
+		oldSwapchain     = {},
+	}
+
+	if VULKAN_STATE.queues.graphics != VULKAN_STATE.queues.present {
+		create_info.imageSharingMode = .CONCURRENT
+		create_info.queueFamilyIndexCount = 2
+		create_info.pQueueFamilyIndices = &queue_indices[0]
+	} else {
+		create_info.imageSharingMode = .EXCLUSIVE
+	}
+
+	result := vk.CreateSwapchainKHR(
+		VULKAN_STATE.device,
+		&create_info,
+		nil,
+		&VULKAN_STATE.swapchain.handle,
+	)
+	if result != .SUCCESS {
+		log.errorf("[BF_GPU/Vulkan] vkCreateSwapchainKHR failed: %v", result)
+		return false
+	}
+
+	VULKAN_STATE.swapchain.format = surface_format.format
+	VULKAN_STATE.swapchain.extent = extent
+
+	result = vk.GetSwapchainImagesKHR(
+		VULKAN_STATE.device,
+		VULKAN_STATE.swapchain.handle,
+		&image_count,
+		nil,
+	)
+	if result != .SUCCESS || image_count == 0 {
+		log.errorf("[BF_GPU/Vulkan] vkGetSwapchainImagesKHR failed: %v", result)
+		vk.DestroySwapchainKHR(VULKAN_STATE.device, VULKAN_STATE.swapchain.handle, nil)
+		VULKAN_STATE.swapchain.handle = {}
+		return false
+	}
+	VULKAN_STATE.swapchain.images = make([]vk.Image, image_count)
+	result = vk.GetSwapchainImagesKHR(
+		VULKAN_STATE.device,
+		VULKAN_STATE.swapchain.handle,
+		&image_count,
+		raw_data(VULKAN_STATE.swapchain.images),
+	)
+	if result != .SUCCESS {
+		log.errorf("[BF_GPU/Vulkan] failed retrieving swapchain images: %v", result)
+	}
+	delete(VULKAN_STATE.swapchain.images)
+	vk.DestroySwapchainKHR(VULKAN_STATE.device, VULKAN_STATE.swapchain.handle, nil)
+	VULKAN_STATE.swapchain.handle = {}
+	return false
+}
+vulkan_create_swapchain_image_views :: proc() -> bool {
+	swapchain := &VULKAN_STATE.swapchain
+	swapchain.image_views = make([]vk.ImageView, swapchain.image_count)
+
+	for i in 0..< swapchain.image_count {
+		create_info := vk.ImageViewCreateInfo {
+			sType = .IMAGE_VIEW_CREATE_INFO,
+			image = swapchain.images[i],
+			viewType = .D2,
+			format = swapchain.format,
+			components = vk.ComponentMapping {
+				r = .IDENTITY,
+				g = .IDENTITY,
+				b = .IDENTITY,
+				a = .IDENTITY,
+			},
+			subresourceRange = vk.ImageSubresourceRange {
+				aspectMask = {.COLOR},
+				baseMipLevel = 0,
+				levelCount = 1,
+				baseArrayLayer = 0,
+				layerCount = 1,
+			},
+		}
+		result := vk.CreateImageView(
+			VULKAN_STATE.device,
+			&create_info,
+			nil,
+			&swapchain.image_views[i],
+		)
+		if result != .SUCCESS {
+			log.errorf("[BF_GPU/Vulkan] vkCreateImageView for swapchain image %d: %v", i, result)
+			for j in 0..<i {
+				vk.DestroyImageView(
+					VULKAN_STATE.device,
+					swapchain.image_views[j],
+					nil,
+				)
+			}
+			delete(swapchain.image_views)
+			swapchain.image_views = nil
+			return false
+		}
+	}
+	return true
+}
+vulkan_destroy_swapchain :: proc() {
+	swapchain := &VULKAN_STATE.swapchain
+	for view in swapchain.image_views {
+		if view != {} {
+			vk.DestroyImageView(
+				VULKAN_STATE.device,
+				view,
+				nil,
+			)
+		}
+	}
+	delete(swapchain.image_views)
+	swapchain.image_views = nil
+
+	if swapchain.handle != {} {
+		vk.DestroySwapchainKHR(
+			VULKAN_STATE.device,
+			swapchain.handle,
+			nil,
+		)
+		swapchain.handle = {}
+	}
+	swapchain^ = {}
+}
+//* =====================================================================
 
 vulkan_find_queue_families :: proc(device: vk.PhysicalDevice) -> Vulkan_Queue_Family {
 	result := Vulkan_Queue_Family{}
