@@ -169,7 +169,7 @@ vulkan_create_instance :: proc() -> bool {
 	return true
 }
 
-//* PICK PHYSICAL DEVICE 
+//* PICK PHYSICAL DEVICE
 // prior to logical device creation
 vulkan_pick_physical_device :: proc() -> bool {
 	count: u32
@@ -424,10 +424,10 @@ vulkan_create_swapchain :: proc() -> bool {
 	if !ok do return false
 	formats, ok2 := vulkan_query_surface_formats(device)
 	if !ok2 do return false
+	defer delete(formats)
 	present_modes, ok3 := vulkan_query_present_modes(device)
 	if !ok3 do return false
 	defer delete(present_modes)
-
 	surface_format, ok4 := vulkan_choose_surface_format(formats)
 	if !ok4 {
 		log.error("[BF_GPU/Vulkan] Failed to choose surface format")
@@ -489,8 +489,7 @@ vulkan_create_swapchain :: proc() -> bool {
 	)
 	if result != .SUCCESS || image_count == 0 {
 		log.errorf("[BF_GPU/Vulkan] vkGetSwapchainImagesKHR failed: %v", result)
-		vk.DestroySwapchainKHR(VULKAN_STATE.device, VULKAN_STATE.swapchain.handle, nil)
-		VULKAN_STATE.swapchain.handle = {}
+		vulkan_destroy_swapchain()
 		return false
 	}
 	VULKAN_STATE.swapchain.images = make([]vk.Image, image_count)
@@ -501,18 +500,29 @@ vulkan_create_swapchain :: proc() -> bool {
 		raw_data(VULKAN_STATE.swapchain.images),
 	)
 	if result != .SUCCESS {
-		log.errorf("[BF_GPU/Vulkan] failed retrieving swapchain images: %v", result)
+		log.errorf("[BF_GPU/Vulkan] vkGetSwapchainImagesKHR failed: %v", result)
+		delete(VULKAN_STATE.swapchain.images)
+		VULKAN_STATE.swapchain.images = nil
+		vk.DestroySwapchainKHR(VULKAN_STATE.device, VULKAN_STATE.swapchain.handle, nil)
+		VULKAN_STATE.swapchain.handle = {}
+		return false
 	}
-	delete(VULKAN_STATE.swapchain.images)
-	vk.DestroySwapchainKHR(VULKAN_STATE.device, VULKAN_STATE.swapchain.handle, nil)
-	VULKAN_STATE.swapchain.handle = {}
-	return false
+
+	VULKAN_STATE.swapchain.image_count = image_count
+	log.infof(
+		"[BF_GPU/Vulkan] Swapchain created: %d%d, images=%d",
+		extent.width,
+		extent.height,
+		image_count
+	)
+
+	return true
 }
 vulkan_create_swapchain_image_views :: proc() -> bool {
 	swapchain := &VULKAN_STATE.swapchain
 	swapchain.image_views = make([]vk.ImageView, swapchain.image_count)
 
-	for i in 0..< swapchain.image_count {
+	for i in 0 ..< swapchain.image_count {
 		create_info := vk.ImageViewCreateInfo {
 			sType = .IMAGE_VIEW_CREATE_INFO,
 			image = swapchain.images[i],
@@ -540,12 +550,8 @@ vulkan_create_swapchain_image_views :: proc() -> bool {
 		)
 		if result != .SUCCESS {
 			log.errorf("[BF_GPU/Vulkan] vkCreateImageView for swapchain image %d: %v", i, result)
-			for j in 0..<i {
-				vk.DestroyImageView(
-					VULKAN_STATE.device,
-					swapchain.image_views[j],
-					nil,
-				)
+			for j in 0..< i {
+				vk.DestroyImageView(VULKAN_STATE.device, swapchain.image_views[j], nil)
 			}
 			delete(swapchain.image_views)
 			swapchain.image_views = nil
@@ -558,25 +564,30 @@ vulkan_destroy_swapchain :: proc() {
 	swapchain := &VULKAN_STATE.swapchain
 	for view in swapchain.image_views {
 		if view != {} {
-			vk.DestroyImageView(
-				VULKAN_STATE.device,
-				view,
-				nil,
-			)
+			vk.DestroyImageView(VULKAN_STATE.device, view, nil)
 		}
 	}
 	delete(swapchain.image_views)
 	swapchain.image_views = nil
 
 	if swapchain.handle != {} {
-		vk.DestroySwapchainKHR(
-			VULKAN_STATE.device,
-			swapchain.handle,
-			nil,
-		)
+		vk.DestroySwapchainKHR(VULKAN_STATE.device, swapchain.handle, nil)
 		swapchain.handle = {}
 	}
 	swapchain^ = {}
+}
+//* SWAPCHAIN RUNTIME
+vulkan_acquire_next_image :: proc(frame: ^Vulkan_Frame) -> (u32, vk.Result) {
+	image_index: u32
+	result := vk.AcquireNextImageKHR(
+		VULKAN_STATE.device,
+		VULKAN_STATE.swapchain.handle,
+		0xFFFFFFFFFFFFFFFF,
+		frame.image_available,
+		{},
+		&image_index,
+	)
+	return image_index, result
 }
 //* =====================================================================
 

@@ -93,3 +93,30 @@ vulkan_create_renderer_buffers :: proc(
 	refresh_frame_addresses(frame)
 	return true
 }
+
+//* RUNTIME ==============================================
+vulkan_begin_command_buffer :: proc(cmd_buffer: vk.CommandBuffer) -> bool {
+	result := vk.ResetCommandBuffer(cmd_buffer, {})
+	if result != .SUCCESS {
+		log.errorf("[BF_GPU/Vulkan] vkResetCommandBuffer failed: %v", result)
+		return false
+	}
+	begin_info := vk.CommandBufferBeginInfo {
+		sType = .COMMAND_BUFFER_BEGIN_INFO,
+		flags = {},
+	}
+	result = vk.BeginCommandBuffer(cmd_buffer, &begin_info)
+	if result != .SUCCESS {
+		log.errorf("[BF_GPU/Vulkan] vkBeginCommandBuffer failed: %v", result)
+		return false
+	}
+	return true
+}
+vulkan_end_command_buffer :: proc(cmd_buffer: vk.CommandBuffer) -> bool {
+	result := vk.EndCommandBuffer(cmd_buffer)
+	if result != .SUCCESS {
+		log.errorf("[BF_GPU/Vulkan] vkEndCommandBuffer failed: %v", result)
+		return false
+	}
+	return true
+}
