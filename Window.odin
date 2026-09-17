@@ -371,7 +371,7 @@ vulkan_create_surface :: proc() -> bool {
 
 	sdl_window := cast(^sdl.Window)window.handle
 	if !sdl.Vulkan_CreateSurface(sdl_window, VULKAN_STATE.instance, nil, &VULKAN_STATE.surface){
-		log.errorf("[BF_GPU/Vulkan] SDL_Vulkan_CreateSurface failed: &s", sdl.GetError())
+		log.errorf("[BF_GPU/Vulkan] SDL_Vulkan_CreateSurface failed: %s", sdl.GetError())
 		return false
 	}
 	window_set_surface(cast(u64)VULKAN_STATE.surface)

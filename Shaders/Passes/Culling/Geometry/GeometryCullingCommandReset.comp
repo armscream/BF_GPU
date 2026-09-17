@@ -13,7 +13,7 @@ layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 layout(push_constant) uniform PushConstants {
     CullingCommandResetPC pc;
 };
-    
+
 void main() {
     FrameGlobalContext ctx = GET_FRAME_CONTEXT(pc.frameGlobalContextBufferAddr);
 
@@ -21,15 +21,26 @@ void main() {
     uint id = gl_GlobalInvocationID.x;
     if (id >= ctx.globalIndirectCommandCount) return;
 
-    // 2. Reset Traditional Pipeline Commands
+    // 2. Reset Traditional Pipeline Commands.
+    //    The traditional region of the global indirect command buffer
+    //    uses VkDrawIndexedIndirectCommand (5 u32 = 20 bytes / slot),
+    //    matching the host-side GPU_Indirect_Command mirror in
+    //    BF_GPU/Gpu_Types.odin and the stride recorded in
+    //    vulkan_buffer_layout_kind.
     if (id < ctx.globalTraditionalCommandsCount) {
-        GET_VK_DRAW_CMD(ctx.globalIndirectCommandBufferAddr, id).instanceCount = 0;
-    } 
-    // 3. Reset Meshlet Pipeline Commands
+        GET_VK_DRAW_INDEXED_CMD(ctx.globalIndirectCommandBufferAddr, id).instanceCount = 0;
+    }
+    // 3. Reset Meshlet Pipeline Commands.
+    //    The meshlet region sits immediately after the traditional
+    //    region at byte offset (traditionalCount * 20) and uses
+    //    VkDrawMeshTasksIndirectCommandEXT (3 u32 = 12 bytes / slot).
     else {
-        uint64_t meshletBaseAddr = ctx.globalIndirectCommandBufferAddr + (ctx.globalTraditionalCommandsCount * 16ul);
+        uint64_t meshletBaseAddr = meshlet_indirect_base(
+            ctx.globalIndirectCommandBufferAddr,
+            ctx.globalTraditionalCommandsCount
+        );
         uint localCmdIndex = id - ctx.globalTraditionalCommandsCount;
-        
+
         GET_VK_MESH_TASKS_CMD(meshletBaseAddr, localCmdIndex).groupCountX = 0;
     }
 }

@@ -67,6 +67,11 @@ Module_State :: struct {
 	// DAG node every frame, and render_submit_step signals it after
 	// the backend reports a successful record_frame.
 	gpu_complete: Core.External_Node_Handle,
+	// Renderer-side pending destruction list (Asset_Sync.odin).
+	// gpu_asset_sync_* push replaced / unregistered GPU handles here;
+	// render_submit_step drains entries whose GPU completion tag has
+	// been reached by calling gpu_asset_sync_tick.
+	pending_destroys: Asset_Sync_Pending,
 }
 
 @(private)
@@ -89,6 +94,31 @@ GPU_Backend :: struct {
 	destroy_buffer:      proc(handle: Gpu_Buffer_Handle),
 	destroy_pipeline:    proc(p: rawptr),
 	destroy_shader:      proc(s: rawptr),
+	// GPU image / view / sampler creation + destruction. Image and
+	// sampler creation goes through the GPU_Backend so the asset
+	// pipeline (Resources.odin) can drive it without importing
+	// Vulkan. The handles are backend-defined; consumers receive a
+	// Gpu_Image_Handle etc. and never see VkImage.
+	create_image:        proc(desc: Image_Description) -> Gpu_Image_Handle,
+	create_image_view:   proc(desc: Image_View_Description) -> Gpu_Image_View_Handle,
+	create_sampler:      proc(desc: Sampler_Description) -> Gpu_Sampler_Handle,
+	destroy_image:       proc(handle: Gpu_Image_Handle),
+	destroy_image_view:  proc(handle: Gpu_Image_View_Handle),
+	destroy_sampler:     proc(handle: Gpu_Sampler_Handle),
+	// Asset-owned GPU buffer creation. create_buffer produces a
+	// STORAGE_BUFFER + SHADER_DEVICE_ADDRESS buffer that the
+	// frame-level persistent pools use; asset-owned buffers (mesh
+	// vertex / index, optional bone / morph payloads) need
+	// different VkBufferUsageFlagBits. Asset_Sync calls
+	// create_asset_buffer with the exact set of usages the cooked
+	// payload requires.
+	create_asset_buffer:  proc(usage: Gpu_Buffer_Usage, size: u64, stride: u32) -> Gpu_Buffer_Handle,
+	// flush_deferred_destructions runs every backend-queued
+	// destruction whose GPU work is known to have completed. The
+	// caller passes the latest signaled timeline value (or a
+	// frame index) so the backend can retire entries that are safe
+	// to release. Safe to call when the queue is empty.
+	flush_deferred_destructions: proc(up_to: u64),
 }
 
 register_gpu_backend :: proc(backend: ^GPU_Backend) {
@@ -112,6 +142,12 @@ renderer_init :: proc(settings: GPU_Runtime_Settings, allocator := context.alloc
 		return true
 	}
 
+	// Diagnostics: allocate the rolling per-frame rings before any
+	// subsystem reads DIAGNOSTICS_STATE. Safe to call before Vulkan
+	// exists; the Vulkan side (vulkan_diag_init) takes over once
+	// the device is up.
+	renderer_diagnostics_init()
+
 	s.allocator = allocator
 	s.settings  = settings
 	if s.settings.lod_count == 0 {
@@ -124,6 +160,7 @@ renderer_init :: proc(settings: GPU_Runtime_Settings, allocator := context.alloc
 	gpu_store_init(&s.store, allocator)
 	render_scene_init(&s.scene, allocator)
 	gpu_scene_init(&s.gpu, s.settings, allocator)
+	asset_sync_pending_init(&s.pending_destroys, allocator)
 	s.cameras = make([dynamic]ECS.Entity, 0, 8, allocator)
 
 	// Look up the BF_ECS world service so scene extraction has something
@@ -147,7 +184,7 @@ renderer_init :: proc(settings: GPU_Runtime_Settings, allocator := context.alloc
 	}
 	extraction_source_init(&s.source, s.world, &s.store)
 
-	if !vulkan_init() {
+	if !vulkan_init(&s.frame_ctx) {
 		log.error("[BF_GPU] Failed to initialize Vulkan")
 		return false
 	}
@@ -197,7 +234,13 @@ renderer_shutdown :: proc() {
 	gpu_scene_destroy(&s.gpu)
 	render_scene_destroy(&s.scene)
 	gpu_store_destroy(&s.store)
+	asset_sync_pending_destroy(&s.pending_destroys)
 	frame_context_destroy(&s.frame_ctx)
+	// Diagnostics: tear down only after Vulkan has gone away (so the
+	// Vulkan-side helpers had a chance to release the query pool +
+	// debug messenger). Init was called early; shutdown happens at
+	// the very end so any final-frame dump still sees live data.
+	renderer_diagnostics_shutdown()
 	s^ = {}
 	log.info("[BF_GPU] renderer shutdown")
 }
@@ -205,7 +248,7 @@ renderer_shutdown :: proc() {
 // ===========================================================================
 //* GPU completion external node.
 //
-// The intended dependency chain (prompt_plan §32-34):
+// The intended dependency chain:
 //
 //   ECS/Spatial -> SceneExtract -> Render_Upload -> Render_Submit
 //                                       ^
@@ -215,12 +258,16 @@ renderer_shutdown :: proc() {
 //                              external node created here.
 //
 // The pre-frame hook re-attaches a wait on this node for FramePresent
-// every frame. After render_submit_step succeeds, the renderer signals
-// the node. In v1 the signal happens synchronously (the backend has
-// already completed the submission by the time record_frame returns);
-// once a real GPU fence is wired in the backend can defer the signal
-// until the fence completes and the same wiring still gates
-// FramePresent on real GPU completion.
+// every frame. The signal itself is driven by the Vulkan backend's
+// non-blocking poll of the graphics timeline semaphore
+// (vulkan_poll_graphics_completion in Vk_Frame.odin). The poll runs
+// at the top of vulkan_frame() and at shutdown
+// (vulkan_flush_pending_completion_signals); it fires
+// gpu_completion_signal() for every slot whose timeline value has
+// been reached. This guarantees the BF_DAG external node is only
+// released once the GPU has actually finished the corresponding
+// submission — the signal is no longer an immediate post-record
+// fire.
 
 // gpu_completion_pre_frame_hook is the pre-frame callback the
 // scheduler invokes at the top of every begin_frame. It re-attaches
@@ -335,10 +382,10 @@ gpu_completion_signal :: proc() {
 // ===========================================================================
 //* Camera registry.
 //
-// Explicit active-camera semantics (prompt_plan §93): the renderer owns the
-// camera set and the designation. Extraction never picks "the first camera it
-// found". A registered entity only becomes a Render_Camera while it carries a
-// BF_ECS Camera component.
+// Explicit active-camera semantics: the renderer owns the camera set
+// and the designation. Extraction never picks "the first camera it
+// found". A registered entity only becomes a Render_Camera while it
+// carries a BF_ECS Camera component.
 
 renderer_register_camera :: proc(entity: ECS.Entity) -> bool {
 	s := &MODULE_STATE_VALUE
@@ -427,6 +474,14 @@ scene_extract_step :: proc(raw_ctx: rawptr) {
 	if !s.initialized do return
 	if s.world == nil do return
 
+	frame_begin_ns := diag_begin_frame()
+	// Anchor for the full-frame CPU timer; the frame_present_step
+	// reads and clears this so the total-frame delta lands on the
+	// SAME frame's ring slot, even though the frame_context counter
+	// has been advanced by then.
+	DIAGNOSTICS_STATE.frames_completion_anchor_ns = frame_begin_ns
+	DIAGNOSTICS_STATE.frames_completion_frame_id = s.frame_ctx.frame_idx
+
 	s.source.world = s.world
 	s.source.store = &s.store
 	s.source.cameras = s.cameras[:]
@@ -439,6 +494,9 @@ scene_extract_step :: proc(raw_ctx: rawptr) {
 		return
 	}
 	s.stats = stats
+
+	diag_record_extraction(s.frame_ctx.frame_idx, &s.stats)
+	diag_finish_stage(&DIAGNOSTICS_STATE.cpu.scene_extract, s.frame_ctx.frame_idx, frame_begin_ns)
 }
 
 // render_upload_step runs at .Render_Upload. Walks the freshly extracted
@@ -450,6 +508,8 @@ render_upload_step :: proc(raw_ctx: rawptr) {
 	_ = raw_ctx
 	s := &MODULE_STATE_VALUE
 	if !s.initialized do return
+
+	upload_begin_ns := diag_begin_frame()
 
 	s.gpu.settings = s.settings
 	if !gpu_scene_update(&s.gpu, &s.scene, &s.store) {
@@ -474,42 +534,68 @@ render_upload_step :: proc(raw_ctx: rawptr) {
 	)
 
 	refresh_frame_addresses(&s.frame_ctx)
+
+	diag_record_gpu_scene(s.frame_ctx.frame_idx, &s.gpu)
+	diag_finish_stage(&DIAGNOSTICS_STATE.cpu.upload, s.frame_ctx.frame_idx, upload_begin_ns)
 }
 
 // render_submit_step runs at .Render_Submit. Hands the staged GPU_Scene
 // to the backend for command buffer recording and advances the per-frame
-// counter once the submission is accepted. On success it also signals
-// the GPU completion external node (BF_DAG) so the next frame's
-// FramePresent pre-frame wait releases. In v1 submission is
-// synchronous and the signal fires immediately; a real GPU fence will
-// defer the signal until the fence completes — the rest of the
-// dependency chain stays the same.
+// counter once the submission is accepted. The BF_DAG GPU completion
+// external node is NOT signalled here — it is driven by the Vulkan
+// backend's non-blocking timeline poll
+// (vulkan_poll_graphics_completion in Vk_Frame.odin), which fires
+// only when the GPU has actually reached the submission's timeline
+// value. The next frame's FramePresent gate releases from there.
 render_submit_step :: proc(raw_ctx: rawptr) {
 	_ = raw_ctx
 	s := &MODULE_STATE_VALUE
 	if !s.initialized do return
 
-	if s.backend == nil do return
+	submit_begin_ns := diag_begin_frame()
+
+	if s.backend == nil {
+		diag_finish_stage(&DIAGNOSTICS_STATE.cpu.submit, s.frame_ctx.frame_idx, submit_begin_ns)
+		return
+	}
 	if !s.backend.record_frame(&s.gpu, &s.frame_ctx) {
 		log.warn("[BF_GPU] backend record_frame failed")
+		diag_finish_stage(&DIAGNOSTICS_STATE.cpu.submit, s.frame_ctx.frame_idx, submit_begin_ns)
 		return
 	}
 
 	frame_context_advance(&s.frame_ctx)
 
-	// Mark the frame's GPU work as complete. Pre-frame hook for the
-	// NEXT frame has already attached a wait on this node to that
-	// frame's FramePresent; the wait auto-completes once the node
-	// is signaled.
-	gpu_completion_signal()
+	// Flush asset-side pending destructions whose GPU completion tag
+	// has been reached. We use the just-advanced frame_idx as the
+	// fence value: every entry tagged <= frame_idx is known to be
+	// GPU-complete because the previous frame's submission has been
+	// accepted (record_frame returned true). The backend's own
+	// deferred-destruction queue is invoked as part of the same tick.
+	gpu_asset_sync_tick(&s.pending_destroys, s.backend, s.frame_ctx.frame_idx)
+
+	diag_finish_stage(&DIAGNOSTICS_STATE.cpu.submit, s.frame_ctx.frame_idx, submit_begin_ns)
 }
 
 // frame_present_step runs at .PostRender. Reserved for editor overlays
 // and the swapchain present hook. The actual GPU work is already
 // submitted by the .Render_Submit step; this node is a no-op in v1 and
 // fires after the GPU completion external node wired in by task 9.
+//
+// Diagnostics: this step closes the CPU-side frame timer. We hold the
+// per-frame begin time + frame index on the diagnostics state
+// (DIAGNOSTICS_STATE) so the present step can compute the wall-clock
+// total using the SAME frame index recorded during scene_extract.
 frame_present_step :: proc(raw_ctx: rawptr) {
 	_ = raw_ctx
+	s := &MODULE_STATE_VALUE
+	if !s.initialized do return
+	frame_begin := DIAGNOSTICS_STATE.frames_completion_anchor_ns
+	frame_id    := DIAGNOSTICS_STATE.frames_completion_frame_id
+	if frame_begin != 0 && frame_id != 0 {
+		diag_record_frame_finish(frame_id, frame_begin)
+		DIAGNOSTICS_STATE.frames_completion_anchor_ns = 0
+	}
 }
 
 // ===========================================================================

@@ -52,15 +52,6 @@ Material_Pool :: struct {
 	dense_used: u32,
 }
 
-// Per-entity render state the shaders read through the tag sparse map. This
-// replaces the placeholder "tag" component the renderer used to invent: the
-// data is the packed Render_Instance_Flags, which are themselves derived from
-// Render_Model + Spatial_State.
-Tag_Pool :: struct {
-	data:       [dynamic]u32,
-	dense_used: u32,
-}
-
 // Material lookup table: per (model, mesh) -> dense material index.
 // Lives in its own small buffer so the culling shaders can fetch by
 // materialOffset + meshIndex without indirection into the material pool.
@@ -121,7 +112,6 @@ Scene_Sparse_Maps :: struct {
 	transforms: Sparse_Map,
 	models:     Sparse_Map,
 	cameras:    Sparse_Map,
-	tags:       Sparse_Map,
 }
 
 // ---------------------------------------------------------------------------
@@ -135,7 +125,6 @@ GPU_Scene :: struct {
 	// Slot-parallel pools (dense index == Render_Scene slot).
 	transforms:                  Transform_Pool,
 	models:                      Model_Pool,
-	tags:                        Tag_Pool,
 	instances:                   [dynamic]GPU_Instance,
 	culling:                     [dynamic]GPU_Culling_Instance,
 
@@ -197,7 +186,6 @@ gpu_scene_init :: proc(
 
 	gpu.transforms.data = make([dynamic]Gpu_Transform_Component, 0, DEFAULT_POOL_CAPACITY, allocator)
 	gpu.models.data = make([dynamic]Gpu_Model_Component, 0, DEFAULT_POOL_CAPACITY, allocator)
-	gpu.tags.data = make([dynamic]u32, 0, DEFAULT_POOL_CAPACITY, allocator)
 	gpu.instances = make([dynamic]GPU_Instance, 0, DEFAULT_POOL_CAPACITY, allocator)
 	gpu.culling = make([dynamic]GPU_Culling_Instance, 0, DEFAULT_POOL_CAPACITY, allocator)
 
@@ -220,15 +208,12 @@ gpu_scene_init :: proc(
 	gpu.sparse.models.dense_to_entity = make([dynamic]u32, 0, DEFAULT_POOL_CAPACITY, allocator)
 	gpu.sparse.cameras.entity_to_dense = make([dynamic]u32, 0, DEFAULT_SPARSE_CAPACITY, allocator)
 	gpu.sparse.cameras.dense_to_entity = make([dynamic]u32, 0, 16, allocator)
-	gpu.sparse.tags.entity_to_dense = make([dynamic]u32, 0, DEFAULT_SPARSE_CAPACITY, allocator)
-	gpu.sparse.tags.dense_to_entity = make([dynamic]u32, 0, DEFAULT_POOL_CAPACITY, allocator)
 }
 
 gpu_scene_destroy :: proc(gpu: ^GPU_Scene) {
 	if gpu == nil || gpu.allocator.procedure == nil do return
 	delete(gpu.transforms.data)
 	delete(gpu.models.data)
-	delete(gpu.tags.data)
 	delete(gpu.instances)
 	delete(gpu.culling)
 
@@ -251,8 +236,6 @@ gpu_scene_destroy :: proc(gpu: ^GPU_Scene) {
 	delete(gpu.sparse.models.dense_to_entity)
 	delete(gpu.sparse.cameras.entity_to_dense)
 	delete(gpu.sparse.cameras.dense_to_entity)
-	delete(gpu.sparse.tags.entity_to_dense)
-	delete(gpu.sparse.tags.dense_to_entity)
 	gpu^ = {}
 }
 
@@ -361,9 +344,6 @@ gpu_scene_reserve :: proc(gpu: ^GPU_Scene, slots: int) {
 	for len(gpu.models.data) < slots {
 		append(&gpu.models.data, gpu_model_component_empty())
 	}
-	for len(gpu.tags.data) < slots {
-		append(&gpu.tags.data, 0)
-	}
 	for len(gpu.instances) < slots {
 		append(&gpu.instances, GPU_Instance{})
 	}
@@ -372,7 +352,6 @@ gpu_scene_reserve :: proc(gpu: ^GPU_Scene, slots: int) {
 	}
 	gpu.transforms.dense_used = u32(slots)
 	gpu.models.dense_used = u32(slots)
-	gpu.tags.dense_used = u32(slots)
 }
 
 @(private = "file")
@@ -410,7 +389,6 @@ gpu_scene_write_slot :: proc(gpu: ^GPU_Scene, scene: ^Render_Scene, id: Render_I
 		material_offset = instance.material_override_index,
 		pipeline_offset = gpu.settings.mesh_shaders ? PIPELINE_MESHLET : PIPELINE_TRADITIONAL,
 	}
-	gpu.tags.data[slot] = packed
 	gpu.instances[slot] = GPU_Instance {
 		model                   = instance.gpu_model,
 		transform_index         = slot,
@@ -428,7 +406,6 @@ gpu_scene_write_slot :: proc(gpu: ^GPU_Scene, scene: ^Render_Scene, id: Render_I
 
 	sparse_map_assign(&gpu.sparse.transforms, entity_index, slot)
 	sparse_map_assign(&gpu.sparse.models, entity_index, slot)
-	sparse_map_assign(&gpu.sparse.tags, entity_index, slot)
 }
 
 @(private = "file")
@@ -439,13 +416,11 @@ gpu_scene_clear_slot :: proc(gpu: ^GPU_Scene, removal: Render_Removal) {
 
 	gpu.transforms.data[slot] = {}
 	gpu.models.data[slot] = gpu_model_component_empty()
-	gpu.tags.data[slot] = 0
 	gpu.instances[slot] = {}
 	gpu.culling[slot] = {}
 
 	sparse_map_release(&gpu.sparse.transforms, entity_index, slot)
 	sparse_map_release(&gpu.sparse.models, entity_index, slot)
-	sparse_map_release(&gpu.sparse.tags, entity_index, slot)
 }
 
 // The chunk set the renderer received this frame, mirrored into the GPU

@@ -5,6 +5,8 @@
 
 struct ModelMeshCullingPC {
     uint64_t frameGlobalContextBufferAddr;
+    uint lodCount;
+    float lodBias;
 };
 
 #endif

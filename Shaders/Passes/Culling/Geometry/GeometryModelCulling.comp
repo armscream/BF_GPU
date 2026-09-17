@@ -12,7 +12,6 @@
 #include "../../../Includes/Common/FrameGlobalContext.glsl"
 #include "../../../Includes/Common/Camera.glsl"
 #include "../../../Includes/Common/Transform.glsl"
-#include "../../../Includes/Common/Tag.glsl"
 #include "../../../Includes/Common/Model.glsl"
 #include "../../../Includes/Common/Mesh.glsl"
 #include "../../../Includes/Common/Animation.glsl"
@@ -58,15 +57,10 @@ void main()
     if (link.modelDenseIndex == INVALID_INDEX) return;
     uint entityId = link.entityIndex;
 
-    uint tagSparseIndex = GET_SPARSE_INDEX(ctx.tagSparseMapBufferAddr, entityId);
-    if (tagSparseIndex == INVALID_INDEX) return;
-    uint entityFlags = GET_TAG_DATA(ctx.tagDataBufferAddr, tagSparseIndex);
-
-    bool isActive = (entityFlags & (1u << 0)) != 0;
-    if (!isActive) return;
-
     // 2. Fetch Model component and Entity ID
     ModelComponent modelComp = GET_MODEL_COMP(ctx.modelBufferAddr, link.modelDenseIndex);
+    bool isActive = (modelComp.flags & (1u << 0)) != 0;
+    if (!isActive) return;
     if (modelComp.modelIndex == INVALID_INDEX) return;
 
     // 3. Resolve Transform and Main Camera data
@@ -118,7 +112,7 @@ void main()
     if (IsModelSimpleEnoughForFastPath(safeMeshCount, addrs.vertexCount))
     {
         // Calculate LOD
-        uint lod = CalculateLodFromScreenSize(screenSizePixels);
+        uint lod = CalculateLodFromScreenSize(screenSizePixels, pc.lodBias, pc.lodCount);
         
         for(uint m = 0; m < safeMeshCount; ++m) {
             uint matIdx = GET_MATERIAL_INDEX(ctx.materialLookupBufferAddr, modelComp.materialOffset + m);

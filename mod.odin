@@ -38,6 +38,11 @@ WINDOW_HEIGHT := Core.GLOBAL_PROJECT_SETTINGS.renderer_settings.Window_Height
 // Layout note: every method takes ^Renderer_Extension_Point as the
 // first argument so the renderer can store per-instance state later
 // (Vulkan device, descriptor sets, etc.) without breaking ABI.
+//
+// The renderer-owned `tracker` slot holds the attached-extension
+// bookkeeping list. Extensions never read this field - it is only
+// touched by the renderer-side attach/detach implementations - so
+// adding it does not break the public ABI.
 Renderer_Extension_Point :: struct {
 	attach:                proc(ep: ^Renderer_Extension_Point, extension_name: cstring),
 	detach:                proc(ep: ^Renderer_Extension_Point, extension_name: cstring),
@@ -67,6 +72,8 @@ Renderer_Extension_Point :: struct {
 		parent_material: cstring,
 		overrides: rawptr,
 	) -> bool,
+	// Renderer-private bookkeeping. Extensions must not touch this.
+	tracker:               ^Attached_Extension_Tracker,
 }
 
 // The single, engine-wide name of the service that exposes
@@ -76,13 +83,15 @@ RENDERER_EXTENSION_POINT_SERVICE_NAME :: "Renderer.ExtensionPoint"
 //* STATIC IMPLEMENTATIONS (stubs in v1)
 @(private)
 renderer_ep_attach :: proc(ep: ^Renderer_Extension_Point, extension_name: cstring) {
-	_ = ep
+	tracker := attached_extension_tracker(ep)
+	attached_extension_add(tracker, extension_name)
 	log.infof("[Renderer] Extension attached: %s", extension_name)
 }
 
 @(private)
 renderer_ep_detach :: proc(ep: ^Renderer_Extension_Point, extension_name: cstring) {
-	_ = ep
+	tracker := attached_extension_tracker(ep)
+	attached_extension_remove(tracker, extension_name)
 	log.infof("[Renderer] Extension detached: %s", extension_name)
 }
 
@@ -117,7 +126,12 @@ renderer_ep_register_meshlet_pipeline :: proc(
 	pipeline_descriptor: rawptr,
 ) -> bool {
 	_ = ep
-	_ = pipeline_descriptor
+	if pipeline_name == nil do return false
+	// The renderer keeps the most recently registered descriptor so
+	// the BF_GPU_Mesh pipeline lookup at init time has something to
+	// resolve. BF_GPU_Mesh registers a single descriptor at
+	// module_register; a second register call simply overwrites.
+	MESHLET_PIPELINE_DESCRIPTOR_PTR = pipeline_descriptor
 	log.infof("[Renderer] Meshlet pipeline registered: %s", pipeline_name)
 	return true
 }
@@ -166,9 +180,97 @@ new_renderer_extension_point :: proc(allocator := context.allocator) -> ^Rendere
 @(private)
 destroy_renderer_extension_point :: proc(instance: rawptr) {
 	if instance == nil do return
+	destroy_attached_extension_tracker(cast(^Renderer_Extension_Point)instance)
 	free(cast(^Renderer_Extension_Point)instance, context.allocator)
 }
 
+
+// ---------------------------------------------------------------------------
+// Attached extension tracking.
+//
+// `Renderer_Extension_Point` is the public ABI the renderer hands to
+// extensions; extensions call attach(ep, name) / detach(ep, name) to
+// declare themselves. The renderer needs to know which extensions are
+// attached so it can decide whether to build the optional meshlet
+// pipeline and so `detect_mesh_shaders_extension()` can return the
+// real answer instead of a stub.
+//
+// The tracker lives on a small heap-allocated struct reachable through
+// the user_data slot on the extension point. Attach adds the name to a
+// dynamic list (idempotent: duplicate attaches are no-ops); detach
+// removes the entry. Both list the names so other consumers can walk
+// the attached set without poking at the extension point ABI.
+//
+// The extension point itself keeps the same five-proc surface it has
+// always had; the tracker is an internal detail only the renderer
+// reads.
+// ---------------------------------------------------------------------------
+
+@(private)
+Attached_Extension_Tracker :: struct {
+	names: [dynamic]string,
+}
+
+// MESHLET_PIPELINE_DESCRIPTOR_PTR holds the most recently registered
+// Meshlet_Pipeline_Descriptor. Cleared in destroy_attached_extension_tracker.
+@(private)
+MESHLET_PIPELINE_DESCRIPTOR_PTR: rawptr
+
+@(private)
+attached_extension_tracker :: proc(ep: ^Renderer_Extension_Point) -> ^Attached_Extension_Tracker {
+	if ep == nil do return nil
+	if ep.tracker == nil {
+		ep.tracker = new(Attached_Extension_Tracker, context.allocator)
+		ep.tracker.names = make([dynamic]string, 0, 4)
+	}
+	return ep.tracker
+}
+
+@(private)
+attached_extension_has :: proc(tracker: ^Attached_Extension_Tracker, name: cstring) -> bool {
+	if tracker == nil || name == nil do return false
+	target := string(name)
+	for existing in tracker.names {
+		if existing == target do return true
+	}
+	return false
+}
+
+@(private)
+attached_extension_add :: proc(tracker: ^Attached_Extension_Tracker, name: cstring) {
+	if tracker == nil || name == nil do return
+	target := string(name)
+	for existing in tracker.names {
+		if existing == target do return
+	}
+	append(&tracker.names, target)
+}
+
+@(private)
+attached_extension_remove :: proc(tracker: ^Attached_Extension_Tracker, name: cstring) {
+	if tracker == nil || name == nil do return
+	target := string(name)
+	for existing, i in tracker.names {
+		if existing == target {
+			ordered_remove(&tracker.names, i)
+			return
+		}
+	}
+}
+// tracker the renderer allocates the first time an extension calls
+// ep.attach(). Called from destroy_renderer_extension_point so the
+// tracker goes away when the renderer extension point service is torn
+// down. The tracker lives on the extension point itself so it goes
+// away with the extension point and tests can construct + destroy
+// independent extension points without state leaking across them.
+@(private)
+destroy_attached_extension_tracker :: proc(ep: ^Renderer_Extension_Point) {
+	if ep == nil || ep.tracker == nil do return
+	delete(ep.tracker.names)
+	free(ep.tracker, context.allocator)
+	ep.tracker = nil
+	MESHLET_PIPELINE_DESCRIPTOR_PTR = nil
+}
 
 // === MODULE_IDENTITY (parsed by rbs) ===
 IDENTITY :: Core.Lib_Descriptor {
@@ -331,7 +433,7 @@ module_activate :: proc(ctx: ^Core.Lib_Context) -> bool {
 
 	// Translate the engine's Renderer_Settings into the GPU-side
 	// GPU_Runtime_Settings. Mesh-shader support is NOT a project
-	// setting; it is auto-detected from whether the BF_GPU_Meshlet
+	// setting; it is auto-detected from whether the BF_GPU_Mesh
 	// extension has attached (see detect_mesh_shaders_extension).
 	gpu_settings := GPU_Runtime_Settings {
 		mesh_shaders       = detect_mesh_shaders_extension(ctx),
@@ -341,6 +443,7 @@ module_activate :: proc(ctx: ^Core.Lib_Context) -> bool {
 		async_compute_cull = false,
 		gpu_sort_extension = .None,
 		lod_count          = max(settings.lod_count, 1),
+		lod_bias           = 0.0,
 	}
 	renderer_apply_settings(gpu_settings)
 
@@ -379,7 +482,7 @@ module_unload :: proc(ctx: ^Core.Lib_Context) {
 	log.info("[Renderer] unloaded")
 }
 
-// detect_mesh_shaders_extension returns true if the BF_GPU_Meshlet
+// detect_mesh_shaders_extension returns true if the BF_GPU_Mesh
 // extension has attached to the extension point at startup time. The
 // renderer queries its own extension registry, not a project setting.
 detect_mesh_shaders_extension :: proc(ctx: ^Core.Lib_Context) -> bool {
@@ -392,7 +495,7 @@ detect_mesh_shaders_extension :: proc(ctx: ^Core.Lib_Context) -> bool {
 	if raw == nil do return false
 	reg := cast(^Core.Service_Registry)raw
 
-	// The extension point service exists; presence of BF_GPU_Meshlet
+	// The extension point service exists; presence of BF_GPU_Mesh
 	// in [[extensions]] is reflected by an attached entry on the
 	// extension point. For now we check via a separate flag the
 	// extension writes when it calls ep.attach().
@@ -410,13 +513,25 @@ detect_mesh_shaders_extension :: proc(ctx: ^Core.Lib_Context) -> bool {
 	return meshlet_extension_attached(ep)
 }
 
-// meshlet_extension_attached is a stub. The real implementation walks
-// the extension point's attached_extensions list and looks for one
-// whose descriptor.name == "BF_GPU_Meshlet.Pipeline".
+// meshlet_extension_attached walks the extension point's attached
+// extension list and returns true if BF_GPU_Mesh is currently
+// attached. The renderer uses this to decide whether to build the
+// meshlet (task + mesh) graphics pipeline; the answer is purely
+// based on which extensions are currently attached, regardless of
+// whether the physical device actually supports mesh shaders.
 @(private)
-meshlet_extension_attached :: proc(_: ^Renderer_Extension_Point) -> bool {
-	// Until the extension point tracks attached extensions by name,
-	// this returns false (no meshlet). When BF_GPU_Meshlet is wired
-	// up properly, this becomes a lookup against an attached list.
-	return false
+meshlet_extension_attached :: proc(ep: ^Renderer_Extension_Point) -> bool {
+	if ep == nil do return false
+	tracker := attached_extension_tracker(ep)
+	return attached_extension_has(tracker, "BF_GPU_Mesh")
+}
+
+// meshlet_pipeline_descriptor_get returns the most recently registered
+// Meshlet_Pipeline_Descriptor pointer. Returns nil when BF_GPU_Mesh is
+// not attached or has not registered a pipeline. The renderer does not
+// own the descriptor's lifetime; the extension owns it (it typically
+// points into a static descriptor literal that lives for the module's
+// entire lifetime).
+meshlet_pipeline_descriptor_get :: proc() -> rawptr {
+	return MESHLET_PIPELINE_DESCRIPTOR_PTR
 }

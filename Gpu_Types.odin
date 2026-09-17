@@ -12,6 +12,7 @@
 
 package BF_GPU
 
+import "core:math"
 import mth "../../Core/BF_Math"
 
 // ---------------------------------------------------------------------------
@@ -27,16 +28,98 @@ MATERIAL_RENDER_COUNT :: 8
 INVALID_INDEX          :: u32(0xFFFFFFFF)
 VIS_PIPELINE_BIT       :: 31
 
+// Gpu_Buffer_Usage is the host-side usage bit-set the asset pipeline
+// passes to GPU_Backend.create_asset_buffer. The Vulkan backend
+// translates the bits into vk.BufferUsageFlagBits; other backends
+// translate them to their native equivalents. Asset_Sync uses these
+// bits so the renderer can describe a mesh vertex buffer, an index
+// buffer, or a bone-payload buffer without reaching into the backend's
+// private types.
+Gpu_Buffer_Usage :: bit_set[Gpu_Buffer_Usage_Flag]
+Gpu_Buffer_Usage_Flag :: enum u8 {
+	Vertex_Buffer,
+	Index_Buffer,
+	Storage_Buffer,
+	Uniform_Buffer,
+	Shader_Device_Address,
+	Transfer_Src,
+	Transfer_Dst,
+}
+
 CHUNK_SIZE :: 32
 
 // LOD bin thresholds, copied from Shaders/Includes/Utils/CullingUtils.glsl.
+// The GPU LOD selector uses three descending thresholds: any screen
+// footprint above 512 px maps to LOD 0, above 256 px to LOD 1, above
+// 128 px to LOD 2, otherwise LOD 3. The asset pipeline MUST populate
+// the matching (model, mesh, lod) slots in Gpu_Mesh_Allocation; a slot
+// whose active_types bits are all zero is skipped at cull time.
 LOD_THRESHOLD_0 :: 512.0
 LOD_THRESHOLD_1 :: 256.0
 LOD_THRESHOLD_2 :: 128.0
+LOD_BUCKET_COUNT :: 4
 
 // Fast-path mesh culling thresholds. Mirrors IsModelSimpleEnoughForFastPath.
 MAX_FAST_PATH_MESHES    :: 8
 MAX_FAST_PATH_VERTICES  :: 4096
+
+// lod_threshold_for_index returns the inclusive lower bound of the
+// screen-size bucket the GPU LOD selector maps `lod` to. `idx` is
+// expected in [0, LOD_BUCKET_COUNT-1]. Mirrors the shader-side
+// CalculateLodFromScreenSize thresholds in
+// Shaders/Includes/Utils/CullingUtils.glsl.
+lod_threshold_for_index :: #force_inline proc(idx: u32) -> f32 {
+	switch idx {
+	case 0: return LOD_THRESHOLD_0
+	case 1: return LOD_THRESHOLD_1
+	case 2: return LOD_THRESHOLD_2
+	case:   return 0.0
+	}
+}
+
+// lod_select_from_screen_size mirrors the GLSL
+// CalculateLodFromScreenSize used by every culling compute shader.
+// `screen_size_px` is the projected sphere footprint in pixels (output
+// of IsSphereOccludedPerspective / IsSphereOccludedOrtho).
+// `lod_bias` is a quality knob, positive values bias toward higher
+// detail (smaller LOD index). `lod_count` clamps the output so the
+// shader never picks a slot beyond the baked asset range; values < 1
+// are coerced to 1 so the function is total.
+lod_select_from_screen_size :: #force_inline proc(
+	screen_size_px, lod_bias: f32,
+	lod_count: u32,
+) -> u32 {
+	effective := screen_size_px
+	if lod_bias != 0.0 {
+		effective = screen_size_px * math.pow(2.0, lod_bias)
+	}
+	lod: u32 = 3
+	if effective > LOD_THRESHOLD_0 {
+		lod = 0
+	} else if effective > LOD_THRESHOLD_1 {
+		lod = 1
+	} else if effective > LOD_THRESHOLD_2 {
+		lod = 2
+	}
+	count := lod_count
+	if count == 0 {
+		count = 1
+	}
+	if lod >= count {
+		return count - 1
+	}
+	return lod
+}
+
+// lod_select_threshold_count returns the number of LOD buckets the
+// GPU culling path needs to index, given a project-side `lod_count`
+// setting. The culling shaders always index a 4-slot block per
+// (model, mesh), so the answer is min(lod_count, LOD_BUCKET_COUNT).
+lod_select_threshold_count :: #force_inline proc(lod_count: u32) -> u32 {
+	if lod_count == 0 do return 1
+	if lod_count > LOD_BUCKET_COUNT do return LOD_BUCKET_COUNT
+	return lod_count
+}
 
 // ---------------------------------------------------------------------------
 // Visibility buffer packing. R32G32_UINT, exactly the layout the GLSL
@@ -405,10 +488,6 @@ Gpu_Frame_Global_Context :: struct {
 	camera_buffer_addr:               u64,
 	camera_sparse_map_buffer_addr:    u64,
 
-	// --- tag ---
-	tag_sparse_map_buffer_addr: u64,
-	tag_data_buffer_addr:       u64,
-
 	// --- transform ---
 	transform_buffer_addr:           u64,
 	transform_sparse_map_buffer_addr: u64,
@@ -516,6 +595,22 @@ PC_Frame_Context_Only :: struct {
 	frame_global_context_buffer_addr: u64,
 }
 
+// PC_ModelMeshCulling is the push constant for every geometry culling
+// compute shader (static-chunk, static-model, morton-model, dynamic-
+// model, mesh, morton-chunk). It carries the FrameGlobalContext device
+// address plus the LOD selector knobs so the GPU side does not need
+// to round-trip through the persistent buffer for per-pass tuning.
+// Matches Shaders/Includes/PushConstants/ModelMeshCullingPC.glsl.
+// Total size is 16 bytes; layout (std430):
+//   0  u64 frame_global_context_buffer_addr
+//   8  u32 lod_count
+//  12  f32 lod_bias
+PC_ModelMeshCulling :: struct {
+	frame_global_context_buffer_addr: u64,
+	lod_count:                        u32,
+	lod_bias:                         f32,
+}
+
 PC_Hiz_Linearize_Depth :: struct {
 	frame_global_context_buffer_addr: u64,
 	out_image_size:                   mth.Vec2,
@@ -537,20 +632,26 @@ PC_Traditional_Meshlet_Pass :: struct {
 // Frame-level settings consumed at startup.
 //
 // `mesh_shaders` is NOT a project setting - it is derived at init time
-// from whether the BF_GPU_Meshlet extension has registered a meshlet
+// from whether the BF_GPU_Mesh extension has registered a meshlet
 // pipeline with the extension point. Renderer_Settings has no
 // MeshShaders field; mesh-shader support is governed entirely by the
 // project's [[extensions]] table.
 // ---------------------------------------------------------------------------
 
 GPU_Runtime_Settings :: struct {
-	mesh_shaders:        bool, // auto-detected from BF_GPU_Meshlet extension presence
+	mesh_shaders:        bool, // auto-detected from BF_GPU_Mesh extension presence
 	hiz_occlusion:       bool,
 	frustum_culling:     bool,
 	cone_culling:        bool,
 	async_compute_cull:  bool,
 	gpu_sort_extension:  GPU_Sort_Extension,
 	lod_count:           u32,
+	// Positive values bias the GPU LOD selector toward higher detail
+	// (smaller LOD index), negative values toward coarser LODs. The
+	// selector multiplies the projected screen footprint by 2^lod_bias
+	// before threshold comparison, matching the GLSL
+	// CalculateLodFromScreenSize semantics.
+	lod_bias:            f32,
 }
 
 GPU_Sort_Extension :: enum u8 {

@@ -30,6 +30,166 @@ import "core:log"
 // ---------------------------------------------------------------------------
 
 Gpu_Buffer_Handle :: distinct u64 // backend-defined (opaque); 0 == invalid
+Gpu_Image_Handle   :: distinct u64 // backend-defined (opaque); 0 == invalid
+Gpu_Image_View_Handle :: distinct u64 // backend-defined (opaque); 0 == invalid
+Gpu_Sampler_Handle :: distinct u64 // backend-defined (opaque); 0 == invalid
+
+GPU_IMAGE_INVALID    :: Gpu_Image_Handle(0)
+GPU_IMAGE_VIEW_INVALID :: Gpu_Image_View_Handle(0)
+GPU_SAMPLER_INVALID  :: Gpu_Sampler_Handle(0)
+
+// Image_Usage is the host-side description of an image's intended usages.
+// The backend translates this into VkImageUsageFlags and refuses any
+// combination that the physical device cannot honor. Usage is bit_set so a
+// single allocation can be COLOR_ATTACHMENT + SAMPLED + TRANSFER_DST.
+Image_Usage :: bit_set[Image_Usage_Flag]
+Image_Usage_Flag :: enum {
+	Color_Attachment,
+	Depth_Stencil_Attachment,
+	Sampled,
+	Storage,
+	Transfer_Src,
+	Transfer_Dst,
+	Input_Attachment,
+}
+
+// Image_Extent_2D / Image_Extent_3D carry the host-side image dimensions
+// without leaking vulkan types to callers of the GPU_Backend.
+Image_Extent_2D :: struct {
+	width:  u32,
+	height: u32,
+}
+Image_Extent_3D :: struct {
+	width:  u32,
+	height: u32,
+	depth:  u32,
+}
+
+// Image_Format mirrors the limited subset of vk.Format the renderer
+// actually uses. The backend maps this onto the matching VkFormat and
+// reports unsupported formats back as a failure.
+Image_Format :: enum {
+	Undefined,
+	R8G8B8A8_Unorm,
+	R8G8B8A8_Srgb,
+	B8G8R8A8_Unorm,
+	B8G8R8A8_Srgb,
+	R16G16B16A16_Sfloat,
+	R32G32B32A32_Sfloat,
+	R32_Sfloat,
+	D32_Sfloat,
+	D24_Unorm_S8_Uint,
+	D32_Sfloat_S8_Uint,
+}
+
+// Image_View_Kind is the host-side type describing how an image view
+// samples its image. Maps onto vk.ImageViewType.
+Image_View_Kind :: enum {
+	View_2D,
+	View_2D_Array,
+	View_Cube,
+	View_Cube_Array,
+	View_3D,
+}
+
+// Image_View_Description is the host-side view descriptor passed to the
+// backend's create_image_view. The backend fills in the matching
+// VkImageViewCreateInfo.
+Image_View_Description :: struct {
+	image:      Gpu_Image_Handle,
+	kind:       Image_View_Kind,
+	format:     Image_Format,
+	base_mip:   u32,
+	mip_count:  u32,
+	base_layer: u32,
+	layer_count:u32,
+}
+
+// Default values for Image_View_Description fields are populated by a
+// constructor proc (Odin does not allow defaults on struct fields).
+image_view_description_default :: proc(
+	image: Gpu_Image_Handle,
+	kind:  Image_View_Kind,
+	format: Image_Format,
+) -> Image_View_Description {
+	return Image_View_Description{
+		image       = image,
+		kind        = kind,
+		format      = format,
+		base_mip    = 0,
+		mip_count   = 1,
+		base_layer  = 0,
+		layer_count = 1,
+	}
+}
+
+// Sampler_Description is the host-side descriptor the backend translates
+// into a VkSamplerCreateInfo. Min/mag/mipmap filter + address modes + an
+// optional anisotropy cap.
+Sampler_Filter :: enum {
+	Nearest,
+	Linear,
+}
+
+Sampler_Address_Mode :: enum {
+	Repeat,
+	Mirrored_Repeat,
+	Clamp_To_Edge,
+	Clamp_To_Border,
+}
+
+Sampler_Description :: struct {
+	min_filter:        Sampler_Filter,
+	mag_filter:        Sampler_Filter,
+	mipmap_mode:       Sampler_Filter, // Nearest == NEAREST, Linear == LINEAR
+	address_u:         Sampler_Address_Mode,
+	address_v:         Sampler_Address_Mode,
+	address_w:         Sampler_Address_Mode,
+	max_anisotropy:    f32, // 1.0 disables anisotropy
+	max_lod:           f32,
+	min_lod:           f32,
+}
+
+sampler_description_default :: proc() -> Sampler_Description {
+	return Sampler_Description{
+		min_filter     = .Linear,
+		mag_filter     = .Linear,
+		mipmap_mode    = .Linear,
+		address_u      = .Repeat,
+		address_v      = .Repeat,
+		address_w      = .Repeat,
+		max_anisotropy = 1.0,
+		min_lod        = 0.0,
+		max_lod        = 0.0,
+	}
+}
+
+// Image_Description is the host-side descriptor passed to the backend's
+// create_image. The backend fills in the matching VkImageCreateInfo and
+// VMA allocation. mip_count == 0 means "derive from dimensions".
+Image_Description :: struct {
+	format:      Image_Format,
+	extent:      Image_Extent_2D,
+	mip_count:   u32,
+	usage:       Image_Usage,
+	array_layers:u32,
+	samples:     u32, // MSAA; 1 disables
+}
+
+image_description_default :: proc(
+	format: Image_Format,
+	extent: Image_Extent_2D,
+	usage:  Image_Usage,
+) -> Image_Description {
+	return Image_Description{
+		format       = format,
+		extent       = extent,
+		mip_count    = 1,
+		usage        = usage,
+		array_layers = 1,
+		samples      = 1,
+	}
+}
 
 Gpu_Buffer_Kind :: enum {
 	Global_Instance_Index,
@@ -42,9 +202,6 @@ Gpu_Buffer_Kind :: enum {
 	Camera_Visible_Index,
 	Camera_Pool,
 	Camera_Sparse_Map,
-
-	Tag_Sparse_Map,
-	Tag_Data,
 
 	Transform_Pool,
 	Transform_Sparse_Map,
@@ -77,6 +234,11 @@ Gpu_Buffer_Kind :: enum {
 	Morton_Chunk_Visible_Indirect_Dispatch,
 	Morton_Chunk_Visible_Index,
 	Morton_Chunk_Transforms_Index,
+
+	// The single SSBO the culling / HiZ / Morton / shading shaders read
+	// every frame. Holds the Gpu_Frame_Global_Context struct; pushed
+	// each frame from the host-side mirror.
+	Frame_Global_Context,
 
 	COUNT,
 }
@@ -145,7 +307,7 @@ frame_context_buffer_entry :: #force_inline proc(state: ^Frame_Context_State, ki
 // address lives here; scalar flags live in update_frame_scalar_state().
 // ---------------------------------------------------------------------------
 
-@(private = "file")
+@(private)
 gctx_buffer_addrs := []Gpu_Buffer_Kind {
 	.Global_Instance_Index,
 	.Global_Indirect_Command,
@@ -156,8 +318,6 @@ gctx_buffer_addrs := []Gpu_Buffer_Kind {
 	.Camera_Visible_Index,
 	.Camera_Pool,
 	.Camera_Sparse_Map,
-	.Tag_Sparse_Map,
-	.Tag_Data,
 	.Transform_Pool,
 	.Transform_Sparse_Map,
 	.Transform_Model_Link,
@@ -204,34 +364,32 @@ refresh_frame_addresses :: proc(state: ^Frame_Context_State) {
 		case 6:  fc.camera_visible_index_buffer_addr = addr
 		case 7:  fc.camera_buffer_addr = addr
 		case 8:  fc.camera_sparse_map_buffer_addr = addr
-		case 9:  fc.tag_sparse_map_buffer_addr = addr
-		case 10: fc.tag_data_buffer_addr = addr
-		case 11: fc.transform_buffer_addr = addr
-		case 12: fc.transform_sparse_map_buffer_addr = addr
-		case 13: fc.transform_model_link_buffer_addr = addr
-		case 14: fc.static_chunk_data_buffer_addr = addr
-		case 15: fc.static_chunk_visible_index_buffer_addr = addr
-		case 16: fc.static_chunk_count_buffer_addr = addr
-		case 17: fc.model_address_buffer_addr = addr
-		case 18: fc.model_buffer_addr = addr
-		case 19: fc.model_sparse_map_buffer_addr = addr
-		case 20: fc.model_count_buffer_addr = addr
-		case 21: fc.model_visible_index_buffer_addr = addr
-		case 22: fc.animation_address_buffer_addr = addr
-		case 23: fc.animation_buffer_addr = addr
-		case 24: fc.animation_sparse_map_buffer_addr = addr
-		case 25: fc.material_buffer_addr = addr
-		case 26: fc.material_lookup_buffer_addr = addr
-		case 27: fc.pipeline_lookup_buffer_addr = addr
-		case 28: fc.scene_aabb_buffer_addr = addr
-		case 29: fc.morton_keys_buffer_addr = addr
-		case 30: fc.morton_values_buffer_addr = addr
-		case 31: fc.morton_chunk_data_buffer_addr = addr
-		case 32: fc.morton_chunk_indirect_dispatch_addr = addr
-		case 33: fc.morton_chunk_indirect_draw_addr = addr
-		case 34: fc.morton_chunk_visible_indirect_dispatch_addr = addr
-		case 35: fc.morton_chunk_visible_index_buffer_addr = addr
-		case 36: fc.morton_chunk_transforms_index_buffer_addr = addr
+		case 9:  fc.transform_buffer_addr = addr
+		case 10: fc.transform_sparse_map_buffer_addr = addr
+		case 11: fc.transform_model_link_buffer_addr = addr
+		case 12: fc.static_chunk_data_buffer_addr = addr
+		case 13: fc.static_chunk_visible_index_buffer_addr = addr
+		case 14: fc.static_chunk_count_buffer_addr = addr
+		case 15: fc.model_address_buffer_addr = addr
+		case 16: fc.model_buffer_addr = addr
+		case 17: fc.model_sparse_map_buffer_addr = addr
+		case 18: fc.model_count_buffer_addr = addr
+		case 19: fc.model_visible_index_buffer_addr = addr
+		case 20: fc.animation_address_buffer_addr = addr
+		case 21: fc.animation_buffer_addr = addr
+		case 22: fc.animation_sparse_map_buffer_addr = addr
+		case 23: fc.material_buffer_addr = addr
+		case 24: fc.material_lookup_buffer_addr = addr
+		case 25: fc.pipeline_lookup_buffer_addr = addr
+		case 26: fc.scene_aabb_buffer_addr = addr
+		case 27: fc.morton_keys_buffer_addr = addr
+		case 28: fc.morton_values_buffer_addr = addr
+		case 29: fc.morton_chunk_data_buffer_addr = addr
+		case 30: fc.morton_chunk_indirect_dispatch_addr = addr
+		case 31: fc.morton_chunk_indirect_draw_addr = addr
+		case 32: fc.morton_chunk_visible_indirect_dispatch_addr = addr
+		case 33: fc.morton_chunk_visible_index_buffer_addr = addr
+		case 34: fc.morton_chunk_transforms_index_buffer_addr = addr
 		}
 	}
 }
@@ -314,6 +472,7 @@ CRITICAL_BUFFERS := []Gpu_Buffer_Kind {
 	.Static_Chunk_Data,
 	.Static_Chunk_Count,
 	.Static_Chunk_Visible_Index,
+	.Frame_Global_Context,
 }
 
 frame_context_validate :: proc(state: ^Frame_Context_State) -> bool {

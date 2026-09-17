@@ -12,7 +12,6 @@
 #include "../../../Includes/Common/FrameGlobalContext.glsl"
 #include "../../../Includes/Common/Camera.glsl"
 #include "../../../Includes/Common/Transform.glsl"
-#include "../../../Includes/Common/Tag.glsl"
 #include "../../../Includes/Common/Model.glsl"
 #include "../../../Includes/Common/Mesh.glsl"
 #include "../../../Includes/Common/Material.glsl"
@@ -77,16 +76,11 @@ void main() {
         TransformModelLink link = GET_TRANSFORM_MODEL_LINK(ctx.transformModelLinkBufferAddr, denseIndex);
         if (link.modelDenseIndex == INVALID_INDEX) continue;
         uint entityId = link.entityIndex;
-        
-        uint tagSparseIndex = GET_SPARSE_INDEX(ctx.tagSparseMapBufferAddr, entityId);
-        if (tagSparseIndex == INVALID_INDEX) return;
-        uint entityFlags = GET_TAG_DATA(ctx.tagDataBufferAddr, tagSparseIndex);
-
-        bool isActive = (entityFlags & (1u << 0)) != 0;
-        if (!isActive) return;
 
         TransformComponent transform = GET_TRANSFORM(ctx.transformBufferAddr, denseIndex);
         ModelComponent modelComp = GET_MODEL_COMP(ctx.modelBufferAddr, link.modelDenseIndex);
+        bool isActive = (modelComp.flags & (1u << 0)) != 0;
+        if (!isActive) continue;
         
         ModelAllocationInfo mAlloc = GET_MODEL_ALLOC(ctx.globalModelAllocationBufferAddr, modelComp.modelIndex);
         GpuModelAddresses addrs = GET_MODEL_ADDRESSES(ctx.modelAddressBufferAddr, modelComp.modelIndex);
@@ -128,7 +122,7 @@ void main() {
         if (IsModelSimpleEnoughForFastPath(safeMeshCount, addrs.vertexCount)) 
         {
             // Calculate LOD
-            uint lod = CalculateLodFromScreenSize(screenSizePixels);
+            uint lod = CalculateLodFromScreenSize(screenSizePixels, pc.lodBias, pc.lodCount);
             
             for(uint m = 0; m < safeMeshCount; ++m) {
                 uint matIdx = GET_MATERIAL_INDEX(ctx.materialLookupBufferAddr, modelComp.materialOffset + m);
@@ -144,12 +138,19 @@ void main() {
                     uint slotIndex = 0;
                     uint indirectIdx = meshAlloc.indirectIndices[pipeIdx][matType];
 
-                    // Check pipeline type and atomic add to the correct command buffer
+                    // Check pipeline type and atomic add to the correct command buffer.
+                    // Traditional region uses VkDrawIndexedIndirectCommand
+                    // (20 bytes / slot); meshlet region uses
+                    // VkDrawMeshTasksIndirectCommandEXT (12 bytes / slot) at
+                    // byte offset (traditionalCount * 20).
                     if (pipeIdx == PIPELINE_MESHLET) {
-                        uint64_t meshletBaseAddr = ctx.globalIndirectCommandBufferAddr + (ctx.globalTraditionalCommandsCount * 16ul);
-                        slotIndex = atomicAdd(GET_MESHLET_CMD(meshletBaseAddr, indirectIdx).groupCountX, 1);
+                        uint64_t meshletBaseAddr = meshlet_indirect_base(
+                            ctx.globalIndirectCommandBufferAddr,
+                            ctx.globalTraditionalCommandsCount
+                        );
+                        slotIndex = atomicAdd(GET_VK_MESH_TASKS_CMD(meshletBaseAddr, indirectIdx).groupCountX, 1);
                     } else {
-                        slotIndex = atomicAdd(GET_TRADITIONAL_CMD(ctx.globalIndirectCommandBufferAddr, indirectIdx).instanceCount, 1);
+                        slotIndex = atomicAdd(GET_VK_DRAW_INDEXED_CMD(ctx.globalIndirectCommandBufferAddr, indirectIdx).instanceCount, 1);
                     }
 
                     // Write Instance ID (and encode full visibility flag in the MSB)

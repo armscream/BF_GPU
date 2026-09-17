@@ -124,7 +124,7 @@ void main() {
         }
 
         // 9. Determine LOD based on screen size
-        uint lod = CalculateLodFromScreenSize(screenSizePixels);
+        uint lod = CalculateLodFromScreenSize(screenSizePixels, pc.lodBias, pc.lodCount);
         
         // Resolve Material
         uint matIdx = GET_MATERIAL_INDEX(ctx.materialLookupBufferAddr, modelComp.materialOffset + m);
@@ -140,12 +140,20 @@ void main() {
             uint slotIndex = 0;
             uint indirectIdx = meshAlloc.indirectIndices[pipeIdx][matType];
 
-            // 11. Append instance to the appropriate indirect draw command
+            // 11. Append instance to the appropriate indirect draw command.
+            //     Traditional region uses VkDrawIndexedIndirectCommand
+            //     (20 bytes / slot, matches the host-side GPU_Indirect_Command
+            //     mirror); meshlet region uses VkDrawMeshTasksIndirectCommandEXT
+            //     (12 bytes / slot) and lives at byte offset
+            //     (traditionalCount * 20).
             if (pipeIdx == PIPELINE_MESHLET) {
-                uint64_t meshletBaseAddr = ctx.globalIndirectCommandBufferAddr + (ctx.globalTraditionalCommandsCount * 16ul);
-                slotIndex = atomicAdd(GET_MESHLET_CMD(meshletBaseAddr, indirectIdx).groupCountX, 1);
+                uint64_t meshletBaseAddr = meshlet_indirect_base(
+                    ctx.globalIndirectCommandBufferAddr,
+                    ctx.globalTraditionalCommandsCount
+                );
+                slotIndex = atomicAdd(GET_VK_MESH_TASKS_CMD(meshletBaseAddr, indirectIdx).groupCountX, 1);
             } else {
-                slotIndex = atomicAdd(GET_TRADITIONAL_CMD(ctx.globalIndirectCommandBufferAddr, indirectIdx).instanceCount, 1);
+                slotIndex = atomicAdd(GET_VK_DRAW_INDEXED_CMD(ctx.globalIndirectCommandBufferAddr, indirectIdx).instanceCount, 1);
             }
 
             // Repack payload with precise mesh-level visibility flag and write instance data
