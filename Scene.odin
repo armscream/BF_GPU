@@ -125,7 +125,6 @@ GPU_Scene :: struct {
 	// Slot-parallel pools (dense index == Render_Scene slot).
 	transforms:                  Transform_Pool,
 	models:                      Model_Pool,
-	instances:                   [dynamic]GPU_Instance,
 	culling:                     [dynamic]GPU_Culling_Instance,
 
 	// Frame-global pools.
@@ -137,7 +136,6 @@ GPU_Scene :: struct {
 	mesh_allocations:            Mesh_Allocation_Pool,
 	draw_descriptors:            Mesh_Draw_Descriptor_Pool,
 	model_addresses:             Model_Address_Pool,
-	visible_instances:           [dynamic]u32,
 	indirect_commands:           [dynamic]GPU_Indirect_Command,
 
 	// Chunk-scoped instance ranges, mirroring Render_Scene.chunks. The GPU
@@ -186,7 +184,6 @@ gpu_scene_init :: proc(
 
 	gpu.transforms.data = make([dynamic]Gpu_Transform_Component, 0, DEFAULT_POOL_CAPACITY, allocator)
 	gpu.models.data = make([dynamic]Gpu_Model_Component, 0, DEFAULT_POOL_CAPACITY, allocator)
-	gpu.instances = make([dynamic]GPU_Instance, 0, DEFAULT_POOL_CAPACITY, allocator)
 	gpu.culling = make([dynamic]GPU_Culling_Instance, 0, DEFAULT_POOL_CAPACITY, allocator)
 
 	gpu.cameras.data = make([dynamic]Gpu_Camera, 0, 16, allocator)
@@ -197,7 +194,6 @@ gpu_scene_init :: proc(
 	gpu.mesh_allocations.data = make([dynamic]Gpu_Mesh_Allocation, 0, DEFAULT_POOL_CAPACITY * 4, allocator)
 	gpu.draw_descriptors.data = make([dynamic]Gpu_Mesh_Draw_Descriptor, 0, DEFAULT_POOL_CAPACITY * 4, allocator)
 	gpu.model_addresses.data = make([dynamic]Gpu_Model_Addresses, 0, DEFAULT_POOL_CAPACITY, allocator)
-	gpu.visible_instances = make([dynamic]u32, 0, DEFAULT_POOL_CAPACITY, allocator)
 	gpu.indirect_commands = make([dynamic]GPU_Indirect_Command, 0, DEFAULT_POOL_CAPACITY, allocator)
 	gpu.static_chunks = make([dynamic]Gpu_Static_Chunk, 0, 64, allocator)
 	gpu.chunk_instances = make([dynamic]u32, 0, DEFAULT_POOL_CAPACITY, allocator)
@@ -214,7 +210,6 @@ gpu_scene_destroy :: proc(gpu: ^GPU_Scene) {
 	if gpu == nil || gpu.allocator.procedure == nil do return
 	delete(gpu.transforms.data)
 	delete(gpu.models.data)
-	delete(gpu.instances)
 	delete(gpu.culling)
 
 	delete(gpu.cameras.data)
@@ -225,7 +220,6 @@ gpu_scene_destroy :: proc(gpu: ^GPU_Scene) {
 	delete(gpu.mesh_allocations.data)
 	delete(gpu.draw_descriptors.data)
 	delete(gpu.model_addresses.data)
-	delete(gpu.visible_instances)
 	delete(gpu.indirect_commands)
 	delete(gpu.static_chunks)
 	delete(gpu.chunk_instances)
@@ -344,9 +338,6 @@ gpu_scene_reserve :: proc(gpu: ^GPU_Scene, slots: int) {
 	for len(gpu.models.data) < slots {
 		append(&gpu.models.data, gpu_model_component_empty())
 	}
-	for len(gpu.instances) < slots {
-		append(&gpu.instances, GPU_Instance{})
-	}
 	for len(gpu.culling) < slots {
 		append(&gpu.culling, GPU_Culling_Instance{})
 	}
@@ -368,7 +359,7 @@ gpu_model_component_empty :: proc() -> Gpu_Model_Component {
 @(private = "file")
 gpu_scene_write_slot :: proc(gpu: ^GPU_Scene, scene: ^Render_Scene, id: Render_Instance_ID) {
 	slot := render_instance_index(id)
-	if int(slot) >= len(scene.instances) || int(slot) >= len(gpu.instances) do return
+	if int(slot) >= len(scene.instances) || int(slot) >= len(gpu.culling) do return
 
 	instance := scene.instances[slot]
 	if .Live not_in instance.flags do return
@@ -380,7 +371,9 @@ gpu_scene_write_slot :: proc(gpu: ^GPU_Scene, scene: ^Render_Scene, id: Render_I
 
 	gpu.transforms.data[slot] = Gpu_Transform_Component {
 		transform    = transform.world,
-		transform_it = mat4_from_mat3(transform.normal),
+		// Inverse-transpose of the upper-left 3x3, derived on demand
+		// from the world matrix. Render_Transform no longer caches it.
+		transform_it = mat4_from_mat3(mat3_normal_from_mat4(transform.world)),
 	}
 	gpu.models.data[slot] = Gpu_Model_Component {
 		entity_index    = entity_index,
@@ -388,13 +381,6 @@ gpu_scene_write_slot :: proc(gpu: ^GPU_Scene, scene: ^Render_Scene, id: Render_I
 		flags           = packed,
 		material_offset = instance.material_override_index,
 		pipeline_offset = gpu.settings.mesh_shaders ? PIPELINE_MESHLET : PIPELINE_TRADITIONAL,
-	}
-	gpu.instances[slot] = GPU_Instance {
-		model                   = instance.gpu_model,
-		transform_index         = slot,
-		material_override_index = instance.material_override_index,
-		spatial_index           = slot,
-		flags                   = packed,
 	}
 	gpu.culling[slot] = GPU_Culling_Instance {
 		instance = slot,
@@ -411,12 +397,11 @@ gpu_scene_write_slot :: proc(gpu: ^GPU_Scene, scene: ^Render_Scene, id: Render_I
 @(private = "file")
 gpu_scene_clear_slot :: proc(gpu: ^GPU_Scene, removal: Render_Removal) {
 	slot := render_instance_index(removal.instance)
-	if int(slot) >= len(gpu.instances) do return
+	if int(slot) >= len(gpu.culling) do return
 	entity_index := u32(removal.entity.ix)
 
 	gpu.transforms.data[slot] = {}
 	gpu.models.data[slot] = gpu_model_component_empty()
-	gpu.instances[slot] = {}
 	gpu.culling[slot] = {}
 
 	sparse_map_release(&gpu.sparse.transforms, entity_index, slot)
@@ -424,15 +409,18 @@ gpu_scene_clear_slot :: proc(gpu: ^GPU_Scene, removal: Render_Removal) {
 }
 
 // The chunk set the renderer received this frame, mirrored into the GPU
-// static-chunk buffer. `chunk_instances` is the flattened per-chunk instance
+// static-chunk buffer. `chunk_instances` is the flattened per-chunk slot
 // list the chunk entries index into.
+//
+// chunk_instances is already raw u32 slot indices on the Render_Scene side
+// (post prompt 01), so this is a direct copy with no decode pass.
 @(private = "file")
 gpu_scene_update_chunks :: proc(gpu: ^GPU_Scene, scene: ^Render_Scene) {
 	clear(&gpu.static_chunks)
 	clear(&gpu.chunk_instances)
 
-	for instance_id in scene.chunk_instances {
-		append(&gpu.chunk_instances, render_instance_index(instance_id))
+	for slot in scene.chunk_instances {
+		append(&gpu.chunk_instances, slot)
 	}
 	for chunk in scene.chunks {
 		append(

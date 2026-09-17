@@ -83,6 +83,11 @@ process_completion_signals :: proc(current_counter: u64) -> int {
 vulkan_poll_graphics_completion :: proc() -> int {
 	if !VULKAN_STATE.initialized do return 0
 	counter := vulkan_graphics_timeline_counter()
+	// The renderer-diagnostics timeline-gag check needs the latest
+	// observed counter, not the counter from a successful signal -
+	// a counter that never advances is itself the bug the lag warning
+	// is meant to surface.
+	diag_record_completion_value(counter)
 	return process_completion_signals(counter)
 }
 

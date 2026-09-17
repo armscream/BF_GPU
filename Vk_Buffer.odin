@@ -47,6 +47,13 @@ Vulkan_Buffer :: struct {
 	allocation:     vma.Allocation,
 	size:           vk.DeviceSize,
 	device_address: vk.DeviceAddress,
+	// Host-side usage flags from the create_asset_buffer call. Stored
+	// so the diagnostics layer can attribute per-buffer uploads to
+	// the right Upload_Kind (vertex / index / other) without forcing
+	// the upload path to plumb the kind through. zero for buffers
+	// created via vulkan_create_buffer directly (no host-side kind
+	// attribution then).
+	usage_flags:    Gpu_Buffer_Usage,
 }
 
 Gpu_Buffer_Description :: struct {

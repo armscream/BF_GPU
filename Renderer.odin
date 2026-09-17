@@ -536,6 +536,7 @@ render_upload_step :: proc(raw_ctx: rawptr) {
 	refresh_frame_addresses(&s.frame_ctx)
 
 	diag_record_gpu_scene(s.frame_ctx.frame_idx, &s.gpu)
+	diag_record_scene_memory(s.frame_ctx.frame_idx, &s.scene, &s.gpu)
 	diag_finish_stage(&DIAGNOSTICS_STATE.cpu.upload, s.frame_ctx.frame_idx, upload_begin_ns)
 }
 

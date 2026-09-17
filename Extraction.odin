@@ -12,7 +12,7 @@
 //
 // Required components (an entity without both is not renderable):
 //
-//   Transform                 world / previous_world matrices, dirty flag
+//   Transform                 world matrix, dirty flag
 //   Render_Model              Asset_Ref of the model + Render_Instance_Flags
 //
 // Gates (an entity that fails any of these is skipped for the frame):
@@ -215,7 +215,7 @@ render_scene_init :: proc(
 	scene.cameras = make([dynamic]Render_Camera, 0, 8, allocator)
 	scene.particles = make([dynamic]Render_Particle, 0, 16, allocator)
 	scene.chunks = make([dynamic]Render_Chunk, 0, 64, allocator)
-	scene.chunk_instances = make([dynamic]Render_Instance_ID, 0, capacity, allocator)
+	scene.chunk_instances = make([dynamic]u32, 0, capacity, allocator)
 	scene.entity_to_instance = make(map[ECS.Entity]Render_Instance_ID, allocator)
 	scene.free_slots = make([dynamic]u32, 0, 64, allocator)
 	scene.added = make([dynamic]Render_Instance_ID, 0, 64, allocator)
@@ -385,7 +385,9 @@ chunk_walk_visit :: proc(id: ECS.Chunk_ID, chunk: ^ECS.Chunk_Runtime, user_data:
 	for entity in entities {
 		instance := extract_entity(walk.scene, walk.src, entity, id, walk.stats)
 		if instance != RENDER_INSTANCE_INVALID {
-			append(&walk.scene.chunk_instances, instance)
+			// Store the raw GPU slot index (not the +1 Render_Instance_ID)
+			// so the GPU-side upload is a flat memcpy of u32s.
+			append(&walk.scene.chunk_instances, render_instance_index(instance))
 		}
 	}
 
@@ -508,10 +510,13 @@ extract_entity :: proc(
 	instance.chunk = chunk
 
 	//* TRANSFORM
+	// Only `world` is kept on Render_Transform. The previous-frame and
+	// inverse-transpose copies that used to live here were dropped in
+	// prompt 01 — the GPU side re-derives the inverse-transpose from
+	// `world` at write time, and the previous-frame matrix lives on the
+	// GPU's previous-frame buffer.
 	extracted := Render_Transform {
-		world          = transform.world,
-		previous_world = transform.previous_world,
-		normal         = mat3_normal_from_mat4(transform.world),
+		world = transform.world,
 	}
 	stored := &scene.transforms[slot]
 	if is_new || stored.world != extracted.world || transform.dirty {
@@ -538,10 +543,7 @@ extract_entity :: proc(
 	}
 	spatial := &scene.spatial[slot]
 	spatial.bounds = bounds
-	spatial.chunk = chunk
-	spatial.distance = 0
 	spatial.lod = 0
-	spatial.flags = render_spatial_flags(flags)
 
 	instance.entity = entity
 	instance.transform_index = slot
@@ -577,16 +579,6 @@ RENDER_INSTANCE_PERSISTENT_FLAGS :: Render_Instance_Flags {
 	.Static,
 	.Dynamic,
 	.Pending_Asset,
-}
-
-@(private = "file")
-render_spatial_flags :: proc(flags: Render_Instance_Flags) -> Render_Spatial_Flags {
-	out: Render_Spatial_Flags = {.Visible}
-	if .Cast_Shadow in flags do out |= {.Cast_Shadow}
-	if .Receive_Shadow in flags do out |= {.Receive_Shadow}
-	if .Static in flags do out |= {.Static}
-	if .Dynamic in flags do out |= {.Dynamic}
-	return out
 }
 
 //* SLOT ALLOCATION

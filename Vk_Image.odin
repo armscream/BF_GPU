@@ -459,6 +459,7 @@ vulkan_create_sampler :: proc(desc: Sampler_Description) -> (vk.Sampler, bool) {
 		log.errorf("[BF_GPU/Vulkan] CreateSampler failed: %v", create_result)
 		return {}, false
 	}
+	diag_record_sampler_created()
 	return out, true
 }
 
@@ -493,6 +494,7 @@ vulkan_destroy_sampler_now :: proc(sampler: vk.Sampler) {
 	if VULKAN_STATE.device != nil {
 		vk.DestroySampler(VULKAN_STATE.device, sampler, nil)
 	}
+	diag_record_sampler_destroyed()
 }
 
 // vulkan_clear_resource_maps empties the image / view / sampler handle

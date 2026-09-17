@@ -145,7 +145,8 @@ Render_Removal :: struct {
 }
 
 // One entry per world chunk that contributed to this frame's extraction.
-// The instance range indexes Render_Scene.chunk_instances.
+// The instance range indexes Render_Scene.chunk_instances (a flat list of
+// GPU slot indices).
 Render_Chunk :: struct {
 	id:             Chunk_ID,
 	bounds:         mth.AABB,
@@ -153,27 +154,28 @@ Render_Chunk :: struct {
 	instance_count: u32,
 }
 
-//Later this can become GPU-packed: world mat, prev mat, norm/quat/scale
+// Render_Transform is the per-slot world matrix the renderer mirrors into
+// Gpu_Transform_Component. The previous-frame and inverse-transpose fields
+// that used to live here were dropped in prompt 01:
+//   - previous_world was never read by any CPU path; motion vectors are
+//     derived from the GPU's previous-frame transform buffer.
+//   - normal was an inverse-transpose cached at extraction time but the
+//     GPU side re-derives it from `world` at write time, so the cache was
+//     dead weight.
+//
+// One Mat4 (64 B) per slot.
 Render_Transform :: struct {
-	world:          [16]f32,
-	previous_world: [16]f32,
-	normal:         [9]f32,
+	world: [16]f32,
 }
+
+// Render_Spatial_Metadata is the per-slot spatial data the culling pipeline
+// consumes. Prompt 01 collapsed it to just the data the GPU side actually
+// reads: the world AABB and a per-instance LOD slot. The chunk, distance
+// and spatial flags that used to live here all duplicated fields already
+// kept on Render_Instance, so removing them is a pure CPU/GPU memory win.
 Render_Spatial_Metadata :: struct {
-	bounds:   mth.AABB,
-	chunk:    Chunk_ID,
-	distance: f32,
-	lod:      u16,
-	flags:    Render_Spatial_Flags,
-}
-Render_Spatial_Flags :: bit_set[Render_Spatial_Flag]
-Render_Spatial_Flag :: enum u8 {
-	Visible,
-	Culled,
-	Static,
-	Dynamic,
-	Cast_Shadow,
-	Receive_Shadow,
+	bounds: mth.AABB,
+	lod:    u16,
 }
 // CPU Render_Scene
 Render_Scene :: struct {
@@ -188,7 +190,12 @@ Render_Scene :: struct {
 	cameras:              [dynamic]Render_Camera,
 	particles:            [dynamic]Render_Particle,
 	chunks:               [dynamic]Render_Chunk,
-	chunk_instances:      [dynamic]Render_Instance_ID,
+	// Flat list of GPU slot indices (NOT Render_Instance_ID) for every
+	// contributing instance, in chunk-walk order. The matching
+	// Render_Chunk describes [first_instance, first_instance + count).
+	// Storing raw u32 here keeps the GPU upload path a single append per
+	// entry instead of a render_instance_index(id) decode per entry.
+	chunk_instances:      [dynamic]u32,
 	// Stable entity -> slot mapping plus the retired-slot free list.
 	entity_to_instance:   map[ECS.Entity]Render_Instance_ID,
 	free_slots:           [dynamic]u32,
@@ -314,13 +321,11 @@ Render_Bucket_Set :: struct {
 //* GPU SCENE
 // GPU_Scene itself lives in Scene.odin next to the dense pools it owns; it is
 // a derived representation of Render_Scene and never a second source of truth.
-GPU_Instance :: struct {
-	model:                   GPU_Model_ID,
-	transform_index:         u32,
-	material_override_index: u32,
-	spatial_index:           u32,
-	flags:                   u32,
-}
+//
+// (GPU_Instance was removed in prompt 01: it duplicated fields already kept in
+//  Gpu_Model_Component + the sparse maps and was never read by any other
+//  module. The renderer speaks to instances through the model / transform
+//  pools and the entity->dense sparse maps directly.)
 
 // Packed instance flag bits shared with the GLSL side (tag data buffer and
 // the ModelComponent flags field).

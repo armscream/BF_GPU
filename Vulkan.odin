@@ -510,7 +510,13 @@ if VULKAN_STATE.allocator != nil {
 // against the default GPU_ONLY pool. Cheap on idle heaps, no-op when
 // there is nothing to move. Called by the diagnostics layer on a long
 // period; safe to call any time the GPU is not mid-submit.
-vulkan_run_vma_defragmentation :: proc() {
+//
+// Returns telemetry describing whether the defrag actually ran and
+// what changed, so the diagnostics layer can fold before/after into
+// the rolling defrag counters. `skipped=true` means the 25%-wasted
+// pre-check decided the cost wasn't worth it; the pre/post bytes are
+// still populated so the dump can show "ran, but no improvement".
+vulkan_run_vma_defragmentation :: proc() -> (pre_unused, post_unused: u64, stats_out: vma.DefragmentationStats, skipped: bool) {
 	if VULKAN_STATE.allocator == nil do return
 	if !VULKAN_STATE.initialized do return
 
@@ -522,8 +528,11 @@ vulkan_run_vma_defragmentation :: proc() {
 	// threshold is a reasonable "don't defrag for trivial gains".
 	stats: vma.TotalStatistics
 	vma.CalculateStatistics(VULKAN_STATE.allocator, &stats)
-	unused_bytes := stats.total.statistics.blockBytes - stats.total.statistics.allocationBytes
-	if unused_bytes < (stats.total.statistics.blockBytes / 4) {
+	pre_unused = u64(stats.total.statistics.blockBytes - stats.total.statistics.allocationBytes)
+	pre_block  := u64(stats.total.statistics.blockBytes)
+	if pre_unused < (pre_block / 4) {
+		post_unused = pre_unused
+		skipped = true
 		return
 	}
 
@@ -531,7 +540,6 @@ vulkan_run_vma_defragmentation :: proc() {
 	info.flags = {.ALGORITHM_FAST}
 	info.pool = nil // all pools
 	vma.BeginDefragmentation(VULKAN_STATE.allocator, info, &defrag_ctx)
-	stats_out: vma.DefragmentationStats
 	vma.EndDefragmentation(VULKAN_STATE.allocator, defrag_ctx, &stats_out)
 	if stats_out.allocationsMoved > 0 || stats_out.bytesMoved > 0 {
 		log.infof(
@@ -540,6 +548,12 @@ vulkan_run_vma_defragmentation :: proc() {
 			stats_out.bytesMoved,
 		)
 	}
+	// Capture post-state so the diagnostics layer can report what
+	// the defrag actually changed.
+	post_stats: vma.TotalStatistics
+	vma.CalculateStatistics(VULKAN_STATE.allocator, &post_stats)
+	post_unused = u64(post_stats.total.statistics.blockBytes - post_stats.total.statistics.allocationBytes)
+	return
 }
 
 // Shims that expose VULKAN_STATE.allocator + physical_device to the
@@ -1824,8 +1838,12 @@ vulkan_backend_create_asset_buffer :: proc(
 	VULKAN_BUFFER_NEXT_ID += 1
 	entry := new(Vulkan_Buffer)
 	entry^ = vbuf
+	entry.usage_flags = usage
 	VULKAN_BUFFER_MAP[handle] = entry
-	diag_record_asset_buffer_created(MODULE_STATE_VALUE.frame_ctx.frame_idx)
+	diag_record_asset_buffer_created_with_kind(
+		diag_kind_from_usage(usage),
+		MODULE_STATE_VALUE.frame_ctx.frame_idx,
+	)
 	_ = stride
 	return handle
 }
@@ -1839,9 +1857,12 @@ vulkan_backend_upload_buffer :: proc(handle: Gpu_Buffer_Handle, data: rawptr, si
 	// The frame_index is the just-recorded renderer's frame counter
 	// (the submit step will advance it; recording against the
 	// pre-submit counter keeps "this frame uploaded X bytes" in
-	// matching ring slots).
-	diag_record_upload_bandwidth(MODULE_STATE_VALUE.frame_ctx.frame_idx, size)
-	diag_record_upload_count(MODULE_STATE_VALUE.frame_ctx.frame_idx)
+	// matching ring slots). The kind is inferred from the live
+	// buffer's stored usage flags so per-kind breakdown stays
+	// accurate without forcing the caller to declare it.
+	kind := entry.usage_flags != {} ? diag_kind_from_usage(entry.usage_flags) : .Unknown
+	diag_record_upload_bandwidth_with_kind(kind, MODULE_STATE_VALUE.frame_ctx.frame_idx, size)
+	diag_record_upload_count_with_kind(kind, MODULE_STATE_VALUE.frame_ctx.frame_idx)
 	// Staging upload via a transient host-visible buffer and a copy
 	// command recorded on the current frame's graphics command buffer.
 	// Fast path: slice into the persistent upload ring (allocated in
