@@ -303,6 +303,13 @@ Renderer_Diagnostics :: struct {
 		label_capability:    Debug_Labels_Capability,
 		timestamp_pool_ready:bool,
 	},
+	// Per-arena snapshot. One entry per GPU_Resource_Class; the
+	// arena allocator (Gpu_Arena.odin) updates these every frame.
+	// `arena_count` is the number of currently-initialised arenas so
+	// the dump can report "all 16 arenas live" vs "12 of 16 (mesh
+	// geometry arrived disabled)".
+	arenas:      [int(GPU_Resource_Class.COUNT)]GPU_Arena_Stats,
+	arena_count: u32,
 	// Whether the diagnostics subsystem has been initialised. Set by
 	// renderer_diagnostics_init() and cleared by
 	// renderer_diagnostics_shutdown(). Public accessor reads this to
@@ -2030,6 +2037,65 @@ Memory_Type_Stats :: struct {
 	allocation_count:u32,
 	unused_bytes:    u64,
 	unused_range_count: u32,
+}
+
+// ===========================================================================
+//* GPU arena diagnostics.
+//
+// The arena allocator (Gpu_Arena.odin) lives in the same package but
+// has its own accounting. The diagnostics layer folds per-class bytes
+// into the same per-frame ring the VMA stats already use, so a reviewer
+// can graph "arena bytes vs per-asset bytes" without the dump knowing
+// the arena internals.
+//
+// Public accessors stay lightweight: one record per arena creation +
+// a snapshot reader. The diagnostics layer never owns the arena
+// free-list; it only mirrors capacity / used into the existing upload
+// ring.
+// ===========================================================================
+
+// diag_record_arena_created bumps the arena counter + capacity
+// per-class for the per-frame ring. Called from gpu_arena_init.
+diag_record_arena_created_impl :: proc(class: GPU_Resource_Class, capacity: u64) {
+	if !DIAGNOSTICS_STATE.initialized do return
+	sync.recursive_mutex_lock(&DIAGNOSTICS_MUTEX)
+	defer sync.recursive_mutex_unlock(&DIAGNOSTICS_MUTEX)
+	d := &DIAGNOSTICS_STATE
+	idx := int(class)
+	if idx < 0 || idx >= int(GPU_Resource_Class.COUNT) do return
+	d.arenas[idx].class    = class
+	d.arenas[idx].capacity = capacity
+	d.arena_count += 1
+}
+
+// diag_record_arena_destroyed is the matching teardown hook. The arena
+// capacity drops to 0; live_suballocs are expected to be 0 by the time
+// this is called (the deferred-destruction path retires them first).
+diag_record_arena_destroyed_impl :: proc(class: GPU_Resource_Class) {
+	if !DIAGNOSTICS_STATE.initialized do return
+	sync.recursive_mutex_lock(&DIAGNOSTICS_MUTEX)
+	defer sync.recursive_mutex_unlock(&DIAGNOSTICS_MUTEX)
+	d := &DIAGNOSTICS_STATE
+	idx := int(class)
+	if idx < 0 || idx >= int(GPU_Resource_Class.COUNT) do return
+	d.arenas[idx] = {}
+	if d.arena_count > 0 do d.arena_count -= 1
+}
+
+// diag_record_arena_used updates the per-arena used / free snapshot.
+// Called every frame from vulkan_upload_scene (once per arena) so the
+// per-frame ring tracks transient pressure without an O(free-list)
+// walk in the dump.
+diag_record_arena_used_impl :: proc(class: GPU_Resource_Class, used: u64, free: u64) {
+	if !DIAGNOSTICS_STATE.initialized do return
+	sync.recursive_mutex_lock(&DIAGNOSTICS_MUTEX)
+	defer sync.recursive_mutex_unlock(&DIAGNOSTICS_MUTEX)
+	d := &DIAGNOSTICS_STATE
+	idx := int(class)
+	if idx < 0 || idx >= int(GPU_Resource_Class.COUNT) do return
+	d.arenas[idx].used  = used
+	d.arenas[idx].free  = free
+	d.arenas[idx].peak_used = max(d.arenas[idx].peak_used, used)
 }
 
 // ===========================================================================

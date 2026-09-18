@@ -282,6 +282,15 @@ vulkan_init :: proc(frame: ^Frame_Context_State) -> bool {
 		return false
 	}
 
+	// Persistent GPU arenas (prompt 04). Created after VMA + the per-kind
+	// buffers so the asset pipeline can route vertex / index / meshlet
+	// payloads through them. Failure is logged but not fatal: the asset
+	// path falls back to per-asset VMA allocations when the registry
+	// is not initialised.
+	if !gpu_arena_init_all() {
+		log.warn("[BF_GPU/Vulkan] arena registry init failed; asset uploads will use per-allocation VMA buffers")
+	}
+
 	if !vulkan_descriptor_init() {
 		log.error("[BF_GPU/Vulkan] bindless descriptor model init failed")
 		vulkan_shutdown(frame)
@@ -410,6 +419,10 @@ vulkan_shutdown :: proc(frame: ^Frame_Context_State) {
 	// could create user buffers between init and destroy).
 	clear(&VULKAN_BUFFER_MAP)
 	VULKAN_BUFFER_NEXT_ID = 1
+
+	// Tear down the persistent GPU arenas after the buffer map is
+	// drained so any arena-backed handles were already released.
+	gpu_arena_shutdown_all()
 
 if VULKAN_STATE.allocator != nil {
 		// Release the upload ring before the VMA allocator goes away;
@@ -1781,6 +1794,9 @@ vulkan_backend_create_buffer :: proc(kind: Gpu_Buffer_Kind, size: u64, stride: u
 vulkan_backend_get_device_address :: proc(handle: Gpu_Buffer_Handle) -> u64 {
 	entry, ok := VULKAN_BUFFER_MAP[handle]
 	if !ok || entry == nil do return 0
+	if entry.arena != nil {
+		return u64(entry.arena.device_address) + u64(entry.arena_offset)
+	}
 	return u64(entry.device_address)
 }
 
@@ -1809,6 +1825,13 @@ gpu_buffer_usage_to_vk :: proc(usage: Gpu_Buffer_Usage) -> vk.BufferUsageFlags {
 // allocated as GPU_ONLY memory: Asset_Sync uploads through the
 // existing upload_buffer path, which performs a CPU-side staging
 // copy when the backend supports it.
+//
+// Prompt 04 routing: vertex / index / meshlet-geometric asset payloads
+// are suballocated from the matching persistent GPU_Arena when the
+// arena registry is initialised. The returned handle is backed by the
+// arena (entry.arena != nil); upload_buffer and destroy_buffer pick the
+// arena-aware path automatically. Non-arena usage sets fall through to
+// the original one-VkBuffer-per-asset allocation.
 vulkan_backend_create_asset_buffer :: proc(
 	usage: Gpu_Buffer_Usage,
 	size: u64,
@@ -1818,6 +1841,48 @@ vulkan_backend_create_asset_buffer :: proc(
 		log.error("[BF_GPU/Vulkan] create_asset_buffer called before Vulkan device creation")
 		return Gpu_Buffer_Handle(0)
 	}
+	if size == 0 {
+		log.error("[BF_GPU/Vulkan] create_asset_buffer: zero size")
+		return Gpu_Buffer_Handle(0)
+	}
+
+	// Pick the GPU_Resource_Class that matches this usage set. Returns
+	// .Other when the usage set has no arena route; the function below
+	// then allocates a fresh VkBuffer + VmaAllocation as before.
+	class := gpu_resource_class_from_usage(usage)
+	arena := gpu_arena_for_class(class)
+	if class != .Other && arena != nil && arena.initialized {
+		align: u64 = 4
+		if .Vertex_Buffer in usage || .Index_Buffer in usage do align = 16
+		if .Uniform_Buffer in usage do align = 256
+		offset, alloc_size, ok := gpu_arena_allocate(arena, size, align)
+		if !ok {
+			log.warnf(
+				"[BF_GPU/Vulkan] arena %v exhausted for %d bytes; falling back to per-asset allocation",
+				class, size,
+			)
+		} else {
+			handle := Gpu_Buffer_Handle(VULKAN_BUFFER_NEXT_ID)
+			VULKAN_BUFFER_NEXT_ID += 1
+			entry := new(Vulkan_Buffer)
+			entry.buffer         = arena.buffer
+			entry.allocation     = arena.allocation
+			entry.size           = vk.DeviceSize(alloc_size)
+			entry.device_address = arena.device_address
+			entry.usage_flags    = usage
+			entry.arena          = arena
+			entry.arena_offset   = vk.DeviceSize(offset)
+			entry.arena_size     = vk.DeviceSize(alloc_size)
+			VULKAN_BUFFER_MAP[handle] = entry
+			diag_record_asset_buffer_created_with_kind(
+				diag_kind_from_usage(usage),
+				MODULE_STATE_VALUE.frame_ctx.frame_idx,
+			)
+			_ = stride
+			return handle
+		}
+	}
+
 	vk_usage := gpu_buffer_usage_to_vk(usage)
 	if vk_usage == {} {
 		log.error("[BF_GPU/Vulkan] create_asset_buffer: empty usage set")
@@ -1825,10 +1890,6 @@ vulkan_backend_create_asset_buffer :: proc(
 	}
 	// Asset uploads always need Transfer_Dst.
 	if .TRANSFER_DST not_in vk_usage do vk_usage += {.TRANSFER_DST}
-	if size == 0 {
-		log.error("[BF_GPU/Vulkan] create_asset_buffer: zero size")
-		return Gpu_Buffer_Handle(0)
-	}
 	vbuf, ok := vulkan_create_buffer(vk.DeviceSize(size), vk_usage, .GPU_ONLY)
 	if !ok {
 		return Gpu_Buffer_Handle(0)
@@ -1890,11 +1951,24 @@ vulkan_backend_upload_buffer :: proc(handle: Gpu_Buffer_Handle, data: rawptr, si
 		}
 	}
 
-	copy := vk.BufferCopy {srcOffset = src_offset, dstOffset = 0, size = vk.DeviceSize(size)}
+	copy := vk.BufferCopy {
+		srcOffset = src_offset,
+		dstOffset = entry.arena != nil ? entry.arena_offset : vk.DeviceSize(0),
+		size      = vk.DeviceSize(size),
+	}
 	vk.CmdCopyBuffer(frame.command_buffer, src_buffer, entry.buffer, 1, &copy)
 
 	// Host -> device synchronization barrier (writes by the copy must
-	// be visible to the GPU shader-side reads).
+	// be visible to the GPU shader-side reads). Arena-backed handles
+	// narrow the barrier to the suballocation's [offset, offset+size)
+	// range so unrelated suballocations sharing the arena are not
+	// dragged into the dependency.
+	barrier_offset := vk.DeviceSize(0)
+	barrier_size   := vk.DeviceSize(size)
+	if entry.arena != nil {
+		barrier_offset = entry.arena_offset
+		barrier_size   = entry.arena_size
+	}
 	barrier := vk.BufferMemoryBarrier2 {
 		sType               = .BUFFER_MEMORY_BARRIER_2,
 		srcStageMask        = {.COPY},
@@ -1904,8 +1978,8 @@ vulkan_backend_upload_buffer :: proc(handle: Gpu_Buffer_Handle, data: rawptr, si
 		srcQueueFamilyIndex = vk.QUEUE_FAMILY_IGNORED,
 		dstQueueFamilyIndex = vk.QUEUE_FAMILY_IGNORED,
 		buffer              = entry.buffer,
-		offset              = 0,
-		size                = vk.DeviceSize(size),
+		offset              = barrier_offset,
+		size                = barrier_size,
 	}
 	dep := vk.DependencyInfo {
 		sType                    = .DEPENDENCY_INFO,
@@ -1919,7 +1993,14 @@ vulkan_backend_upload_buffer :: proc(handle: Gpu_Buffer_Handle, data: rawptr, si
 vulkan_backend_destroy_buffer :: proc(handle: Gpu_Buffer_Handle) {
 	entry, ok := VULKAN_BUFFER_MAP[handle]
 	if !ok || entry == nil do return
-	vma.DestroyBuffer(VULKAN_STATE.allocator, entry.buffer, entry.allocation)
+	if entry.arena != nil {
+		// Suballocation: hand the (offset, size) back to the arena.
+		// The underlying VkBuffer + VmaAllocation stay alive until
+		// gpu_arena_shutdown_all runs at shutdown.
+		gpu_arena_free(entry.arena, u64(entry.arena_offset), u64(entry.arena_size))
+	} else if entry.buffer != {} && VULKAN_STATE.allocator != nil {
+		vma.DestroyBuffer(VULKAN_STATE.allocator, entry.buffer, entry.allocation)
+	}
 	free(entry)
 	delete_key(&VULKAN_BUFFER_MAP, handle)
 }

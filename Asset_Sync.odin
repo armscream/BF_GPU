@@ -82,14 +82,23 @@ Cooked_Mesh_Asset :: struct {
 // tightly packed (mip 0 first, then mip 1, ...) in `data`. The sampler
 // description travels with the texture so a reload can swap samplers
 // without reuploading pixels.
+//
+// `async_load` is the runtime hint the streamer consults when it
+// decides whether the texture's upload must finish before the next
+// render frame (false / "blocking") or can be queued onto the async
+// transfer path (true). The hint comes from the .bmat record's
+// `async_load` field so the offline baker can mark peripheral
+// textures (emissive / occlusion / metallicRoughness) as queued
+// while keeping baseColor synchronous.
 Cooked_Texture_Asset :: struct {
-	width:     u32,
-	height:    u32,
-	mip_count: u32,
-	format:    Image_Format,
-	data:      []u8,
-	sampler:   Sampler_Description,
-	usage:     Image_Usage,
+	width:      u32,
+	height:     u32,
+	mip_count:  u32,
+	format:     Image_Format,
+	data:       []u8,
+	sampler:    Sampler_Description,
+	usage:      Image_Usage,
+	async_load: bool,
 }
 
 // Cooked_Material_Asset is the GPU-uploadable slice of a cooked
@@ -98,6 +107,12 @@ Cooked_Texture_Asset :: struct {
 // GPU_TEXTURE_INVALID and the material is registered with the
 // placeholder. The renderer's bindless descriptor update path keeps
 // retrying those lookups every frame.
+//
+// `async_load` is the per-material default that the streamer uses
+// when a Cooked_Texture_Asset does not override it. It is sourced from
+// the .bmat's `async_load` field so the offline baker can flag
+// "peripheral" materials (ones whose textures don't show up in the
+// always-critical PBR pass).
 Cooked_Material_Asset :: struct {
 	base_colour:        mth.Vec4,
 	emissive_colour:    mth.Vec3,
@@ -112,6 +127,7 @@ Cooked_Material_Asset :: struct {
 	normal_texture:      Asset_Ref,
 	orm_texture:         Asset_Ref,
 	emissive_texture:    Asset_Ref,
+	async_load:          bool,
 }
 
 // Cooked_Model_Asset is the GPU-uploadable slice of a cooked model.

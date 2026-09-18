@@ -321,12 +321,81 @@ gpu_scene_update :: proc(
 		gpu_scene_write_slot(gpu, scene, id)
 	}
 
+	gpu_scene_mark_dirty(gpu, scene)
+
 	gpu_scene_update_chunks(gpu, scene)
 	gpu_scene_update_cameras(gpu, scene)
 	gpu_scene_update_counts(gpu, scene, store)
 
 	gpu.frame_idx = scene.frame_index
 	return true
+}
+
+// gpu_scene_mark_dirty feeds the Vulkan upload cursors with the
+// per-frame change sets Render_Scene produced. Each added / updated /
+// removed slot is recorded against the slot-parallel buffers
+// (Transform_Pool, Model_Pool) and the matching entity index is
+// recorded against the entity-indexed sparse maps
+// (Transform_Sparse_Map, Model_Sparse_Map). Cameras, chunks, materials
+// and asset tables keep their existing whole-range / scalar upload
+// behaviour.
+//
+// This is the only step that turns Render_Scene.added / .updated /
+// .removed into GPU upload work; the upload loop in Vk_Buffer.odin
+// consumes the marks lazily when vulkan_record_pool_upload is called.
+//
+// A slot that appears in both `added` (or `updated`) and `removed`
+// in the same frame is impossible in normal extraction (a removed
+// slot cannot simultaneously have its entity visible), but is
+// guarded against anyway: the removal mark wins and the slot is
+// treated as cleared. The dirty-index set is built in a small map
+// first so the lookup is O(1) per added/updated entry.
+@(private)
+gpu_scene_mark_dirty :: proc(gpu: ^GPU_Scene, scene: ^Render_Scene) {
+	_ = gpu
+	removed_slots: map[u32]struct{}
+	defer delete(removed_slots)
+	removed_entities: map[u32]struct{}
+	defer delete(removed_entities)
+	for removal in scene.removed {
+		removed_slots[render_instance_index(removal.instance)] = {}
+		removed_entities[u32(removal.entity.ix)] = {}
+	}
+
+	for id in scene.added {
+		slot := render_instance_index(id)
+		if _, gone := removed_slots[slot]; gone do continue
+		vulkan_mark_slot_dirty(.Transform_Pool, slot)
+		vulkan_mark_slot_dirty(.Model_Pool, slot)
+	}
+	for id in scene.updated {
+		slot := render_instance_index(id)
+		if _, gone := removed_slots[slot]; gone do continue
+		vulkan_mark_slot_dirty(.Transform_Pool, slot)
+		vulkan_mark_slot_dirty(.Model_Pool, slot)
+	}
+	for removal in scene.removed {
+		slot := render_instance_index(removal.instance)
+		entity := u32(removal.entity.ix)
+		vulkan_mark_slot_dirty(.Transform_Pool, slot)
+		vulkan_mark_slot_dirty(.Model_Pool, slot)
+		vulkan_mark_entity_dirty(.Transform_Sparse_Map, entity)
+		vulkan_mark_entity_dirty(.Model_Sparse_Map, entity)
+	}
+	for id in scene.added {
+		slot := render_instance_index(id)
+		entity := u32(scene.instances[slot].entity.ix)
+		if _, gone := removed_entities[entity]; gone do continue
+		vulkan_mark_entity_dirty(.Transform_Sparse_Map, entity)
+		vulkan_mark_entity_dirty(.Model_Sparse_Map, entity)
+	}
+	for id in scene.updated {
+		slot := render_instance_index(id)
+		entity := u32(scene.instances[slot].entity.ix)
+		if _, gone := removed_entities[entity]; gone do continue
+		vulkan_mark_entity_dirty(.Transform_Sparse_Map, entity)
+		vulkan_mark_entity_dirty(.Model_Sparse_Map, entity)
+	}
 }
 
 // Grows every slot-parallel pool so that `slots` entries exist. New entries

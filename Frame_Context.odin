@@ -68,6 +68,12 @@ Image_Extent_3D :: struct {
 // Image_Format mirrors the limited subset of vk.Format the renderer
 // actually uses. The backend maps this onto the matching VkFormat and
 // reports unsupported formats back as a failure.
+//
+// BC7 / BC5 entries support the .btex format's BC compression path
+// (see Engine/src/Tools/texture_baker/btex_format.odin). The
+// backend's create_image translates the host enum onto the matching
+// VkFormat when the device supports the corresponding Vulkan
+// feature; otherwise it fails the upload.
 Image_Format :: enum {
 	Undefined,
 	R8G8B8A8_Unorm,
@@ -80,6 +86,9 @@ Image_Format :: enum {
 	D32_Sfloat,
 	D24_Unorm_S8_Uint,
 	D32_Sfloat_S8_Uint,
+	BC7_Unorm,
+	BC7_Srgb,
+	BC5_Unorm,
 }
 
 // Image_View_Kind is the host-side type describing how an image view

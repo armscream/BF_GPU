@@ -42,6 +42,12 @@ import vk "vendor:vulkan"
 // Vulkan.odin) reaches these through the GPU_Backend vtable. Persistent
 // renderer buffers (per-kind) plus arbitrary user buffers both live
 // here.
+//
+// When `arena != nil` the entry is a suballocation of the named arena:
+// `buffer == arena.buffer`, `allocation == arena.allocation`, and
+// `device_address == arena.device_address + arena_offset`. The upload
+// path issues `vkCmdCopyBuffer(..., arena.buffer, arena_offset, ...)`;
+// destroy calls gpu_arena_free instead of vma.DestroyBuffer.
 Vulkan_Buffer :: struct {
 	buffer:         vk.Buffer,
 	allocation:     vma.Allocation,
@@ -54,6 +60,10 @@ Vulkan_Buffer :: struct {
 	// created via vulkan_create_buffer directly (no host-side kind
 	// attribution then).
 	usage_flags:    Gpu_Buffer_Usage,
+	// Arena backref (nil for buffers with their own VkBuffer).
+	arena:          ^GPU_Arena,
+	arena_offset:   vk.DeviceSize,
+	arena_size:     vk.DeviceSize,
 }
 
 Gpu_Buffer_Description :: struct {
@@ -230,20 +240,41 @@ vulkan_resize_buffer :: proc(kind: Gpu_Buffer_Kind, new_capacity: u64) -> (Vulka
 // already issued.
 // ---------------------------------------------------------------------------
 
+// Dirty_Range is a half-open element range [first, last) inside a
+// pool. The upload path records one vkCmdCopyBuffer per range so
+// unchanged elements stay GPU-resident.
+Dirty_Range :: struct {
+	first: u32, // inclusive element index
+	last:  u32, // exclusive element index
+}
+
 // Per-pool upload cursor. The host-side copy only writes slots
 // [0, dense_used), but the GPU buffer is sized to capacity elements.
-// On the first upload we copy the full range; subsequent uploads only
-// touch (last_uploaded, dense_used). On a resize the cursor is reset to
-// 0 so the next upload repopulates the new buffer from scratch.
+// On the first upload (last_uploaded_to == 0) we copy the full range;
+// subsequent uploads only touch the dirty slots/entities accumulated
+// since the previous frame plus the freshly-grown tail
+// [last_uploaded_to, dense_used) when the pool extended. On a resize
+// the cursor is reset to 0 so the next upload repopulates the new
+// buffer from scratch.
 //
-// Capacity grow counts the *current* GPU-side capacity, not the
-// pre-resize one. When dense_used exceeds capacity the persistent
-// buffer is grown to the next power of two >= dense_used.
+// dirty_slots is the per-kind source of "this slot was added / updated
+// / removed since the previous upload" markers. Transform_Pool and
+// Model_Pool use it. dirty_entities is the parallel list for
+// entity-indexed pools (Transform_Sparse_Map, Model_Sparse_Map). Each
+// cursor only populates the list that matches its pool kind.
+//
+// ranges is the result of merging / sorting the dirty list plus the
+// tail into minimal disjoint Dirty_Range entries after the last
+// upload. bytes is the corresponding total bytes for diagnostics.
 @(private)
 Vulkan_Upload_Cursor :: struct {
-	dense_used:     u32, // last GPU-side element count
-	capacity:       u64, // current GPU buffer element capacity (== frame.buffers[kind].capacity)
-	last_uploaded_to:u32, // exclusive end of the last per-frame range
+	dense_used:      u32, // last GPU-side element count
+	capacity:        u64, // current GPU buffer element capacity (== frame.buffers[kind].capacity)
+	last_uploaded_to: u32, // exclusive end of the last per-frame range
+	dirty_slots:     [dynamic]u32, // slot indices needing upload
+	dirty_entities:  [dynamic]u32, // entity indices needing upload
+	ranges:          [dynamic]Dirty_Range, // last computed ranges (diagnostics)
+	bytes:           u64, // bytes uploaded by the last call (diagnostics)
 }
 
 @(private)
@@ -296,6 +327,10 @@ vulkan_init_renderer_buffers :: proc(frame: ^Frame_Context_State) -> bool {
 			dense_used      = 0,
 			capacity        = desc.capacity,
 			last_uploaded_to= 0,
+			dirty_slots     = make([dynamic]u32, 0, 256, context.allocator),
+			dirty_entities  = make([dynamic]u32, 0, 256, context.allocator),
+			ranges          = make([dynamic]Dirty_Range, 0, 64, context.allocator),
+			bytes           = 0,
 		}
 	}
 	refresh_frame_addresses(frame)
@@ -312,8 +347,78 @@ vulkan_destroy_renderer_buffers :: proc(frame: ^Frame_Context_State) {
 		if entry_handle == Gpu_Buffer_Handle(0) {continue}
 		vulkan_backend_destroy_buffer(entry_handle)
 		frame.buffers[kind] = {}
-		VULKAN_UPLOAD_CURSORS[kind] = {}
+		cursor := &VULKAN_UPLOAD_CURSORS[kind]
+		delete(cursor.dirty_slots)
+		delete(cursor.dirty_entities)
+		delete(cursor.ranges)
+		cursor^ = {}
 	}
+}
+
+// vulkan_mark_slot_dirty records a slot index that needs to be re-uploaded
+// for `kind`. The caller (Scene.odin's gpu_scene_update) feeds this from
+// Render_Scene's added/updated/removed change sets. Use only for kinds
+// whose pool is slot-indexed (Transform_Pool, Model_Pool).
+vulkan_mark_slot_dirty :: proc(kind: Gpu_Buffer_Kind, slot: u32) {
+	cursor := &VULKAN_UPLOAD_CURSORS[kind]
+	if int(kind) < 0 || int(kind) >= int(Gpu_Buffer_Kind.COUNT) do return
+	ensure_cursor_dirty_alloc(cursor)
+	append(&cursor.dirty_slots, slot)
+}
+
+// vulkan_mark_entity_dirty records an entity index that needs to be
+// re-uploaded for `kind`. Use only for kinds whose pool is
+// entity-indexed (Transform_Sparse_Map, Model_Sparse_Map).
+vulkan_mark_entity_dirty :: proc(kind: Gpu_Buffer_Kind, entity: u32) {
+	cursor := &VULKAN_UPLOAD_CURSORS[kind]
+	if int(kind) < 0 || int(kind) >= int(Gpu_Buffer_Kind.COUNT) do return
+	ensure_cursor_dirty_alloc(cursor)
+	append(&cursor.dirty_entities, entity)
+}
+
+// ensure_cursor_dirty_alloc installs context.allocator on the cursor's
+// dirty-tracking dynamic arrays when they were never initialised (the
+// test paths and the first-frame-before-vulkan_init path). Odin's
+// zero-value dynamic array defaults to context.allocator for `append`,
+// but the memory tracker treats the resulting allocation as a leak
+// because the underlying call site never recorded a matching free.
+// Initialising the allocator explicitly keeps the tracker happy and
+// keeps the allocators consistent with the rest of the renderer.
+@(private)
+ensure_cursor_dirty_alloc :: proc(cursor: ^Vulkan_Upload_Cursor) {
+	if cursor.dirty_slots.allocator.procedure == nil {
+		cursor.dirty_slots.allocator = context.allocator
+	}
+	if cursor.dirty_entities.allocator.procedure == nil {
+		cursor.dirty_entities.allocator = context.allocator
+	}
+	if cursor.ranges.allocator.procedure == nil {
+		cursor.ranges.allocator = context.allocator
+	}
+}
+
+// vulkan_reset_dirty clears every dirty mark on a single kind without
+// flushing anything. Used by tests + the asset-upload path when a pool
+// is wholesale-repopulated outside the per-frame change sets.
+vulkan_reset_dirty :: proc(kind: Gpu_Buffer_Kind) {
+	cursor := &VULKAN_UPLOAD_CURSORS[kind]
+	clear(&cursor.dirty_slots)
+	clear(&cursor.dirty_entities)
+	clear(&cursor.ranges)
+	cursor.bytes = 0
+}
+
+// vulkan_last_upload_ranges returns the most recent ranges[] the upload
+// path emitted for `kind`. Empty when the last upload was a no-op.
+vulkan_last_upload_ranges :: proc(kind: Gpu_Buffer_Kind) -> []Dirty_Range {
+	cursor := &VULKAN_UPLOAD_CURSORS[kind]
+	return cursor.ranges[:]
+}
+
+// vulkan_last_upload_bytes returns the byte count of the most recent
+// upload for `kind`.
+vulkan_last_upload_bytes :: proc(kind: Gpu_Buffer_Kind) -> u64 {
+	return VULKAN_UPLOAD_CURSORS[kind].bytes
 }
 
 // ---------------------------------------------------------------------------
@@ -398,14 +503,63 @@ vulkan_record_pool_upload :: proc(
 		return vulkan_record_pool_upload(cmd_buffer, frame, kind, data, count, stride)
 	}
 
-	// Upload a single contiguous [0, count) slice. First-frame uploads
-	// have last_uploaded_to == 0 so the copy covers the full range;
-	// subsequent frames only need to cover the diff if the data
-	// changed. The host-side `data` slice is the authoritative source.
-	byte_count := u64(count) * u64(stride)
-	offset := vk.DeviceSize(0) // we always re-upload the full range once resizes are settled
+	// Build the dirty range set. Three sources contribute:
+	//
+	//   1. Dirty slots the host side marked via vulkan_mark_slot_dirty
+	//      (slot-parallel pools: Transform_Pool, Model_Pool).
+	//   2. Dirty entities the host side marked via
+	//      vulkan_mark_entity_dirty (entity-indexed pools:
+	//      Transform_Sparse_Map, Model_Sparse_Map).
+	//   3. The freshly-grown tail [last_uploaded_to, count), so newly
+	//      reserved memory is uploaded with at least its zero state.
+	//
+	// First-frame uploads have last_uploaded_to == 0; the tail covers
+	// the whole pool and the dirty marks contribute zero extra bytes.
+	ranges_buf: [dynamic]Dirty_Range
+	ranges_buf.allocator = context.allocator
+	defer delete(ranges_buf)
 
-	if byte_count == 0 do return true
+	if count > cursor.last_uploaded_to {
+		append(
+			&ranges_buf,
+			Dirty_Range{first = cursor.last_uploaded_to, last = count},
+		)
+	}
+
+	slot_or_entity_dirty := false
+	if len(cursor.dirty_slots) > 0 {
+		slot_or_entity_dirty = true
+		append_ranges_from_dirty_indices(&ranges_buf, cursor.dirty_slots[:])
+	}
+	if len(cursor.dirty_entities) > 0 {
+		slot_or_entity_dirty = true
+		append_ranges_from_dirty_indices(&ranges_buf, cursor.dirty_entities[:])
+	}
+	_ = slot_or_entity_dirty
+
+	// Cap to the live pool so a stale slot index in the dirty list
+	// (e.g. a removal that landed on a slot the cursor has already
+	// forgotten about) cannot push us past the buffer.
+	for &r in ranges_buf {
+		if r.last > count do r.last = count
+	}
+
+	if len(ranges_buf) > 1 {
+		merge_overlapping_ranges(&ranges_buf)
+	}
+
+	if len(ranges_buf) == 0 {
+		// Nothing changed this frame. Clear dirty markers (they may
+		// have been emptied by the cap pass) and exit without a copy
+		// or a barrier.
+		clear(&cursor.dirty_slots)
+		clear(&cursor.dirty_entities)
+		clear(&cursor.ranges)
+		cursor.bytes = 0
+		cursor.last_uploaded_to = max(cursor.last_uploaded_to, count)
+		frame.buffers[kind].capacity = cursor.capacity
+		return true
+	}
 
 	dst_entry := VULKAN_BUFFER_MAP[frame.buffers[kind].handle]
 	if dst_entry == nil || dst_entry.buffer == {} {
@@ -413,38 +567,51 @@ vulkan_record_pool_upload :: proc(
 		return false
 	}
 
-	// Fast path: allocate from the persistent upload ring. The ring's
-	// slot for the current frame was zeroed at the top of the frame
-	// (vulkan_frame -> vulkan_upload_ring_reset_slot). Falls back to
-	// vulkan_create_staging_buffer if the slot is full (size > slot)
-	// or the ring isn't initialized.
-	slot := u32(VULKAN_STATE.frame_index)
-	src_buffer, src_offset, src_ptr, ring_ok := vulkan_upload_ring_alloc(
-		slot,
-		byte_count,
-		4,
-	)
-	if ring_ok {
-		mem.copy(src_ptr, data, int(byte_count))
-	} else {
-		ring_src: vk.Buffer
-		ring_alloc: vma.Allocation
-		ring_src, ring_alloc, ring_ok = vulkan_create_staging_buffer(data, byte_count)
-		if !ring_ok do return false
-		defer vma.DestroyBuffer(VULKAN_STATE.allocator, ring_src, ring_alloc)
-		src_buffer = ring_src
-		src_offset = 0
+	// One (buffer, base_offset) pair per range. Each range produces one
+	// vkCmdCopyBuffer so we keep the granularity of "dirty" at the
+	// range level instead of staging the whole pool.
+	total_bytes: u64 = 0
+	for r in ranges_buf {
+		bc := u64(r.last - r.first) * u64(stride)
+		if bc == 0 do continue
+		total_bytes += bc
+
+		ring_size := align_up_u64(bc, 4)
+		ring_slot := u32(VULKAN_STATE.frame_index)
+		src_buffer, src_offset, src_ptr, ring_ok := vulkan_upload_ring_alloc(
+			ring_slot,
+			ring_size,
+			4,
+		)
+		if ring_ok {
+			src_base := rawptr(uintptr(data) + uintptr(r.first) * uintptr(stride))
+			mem.copy(src_ptr, src_base, int(bc))
+		} else {
+			// Cold path: allocate a one-shot staging buffer for this
+			// range only (not the whole pool).
+			src_base := rawptr(uintptr(data) + uintptr(r.first) * uintptr(stride))
+			staging, staging_alloc, staging_ok := vulkan_create_staging_buffer(
+				src_base,
+				bc,
+			)
+			if !staging_ok do return false
+			defer vma.DestroyBuffer(VULKAN_STATE.allocator, staging, staging_alloc)
+			src_buffer = staging
+			src_offset = 0
+		}
+
+		copy := vk.BufferCopy {
+			srcOffset = src_offset,
+			dstOffset = vk.DeviceSize(u64(r.first) * u64(stride)),
+			size      = vk.DeviceSize(bc),
+		}
+		vk.CmdCopyBuffer(cmd_buffer, src_buffer, dst_entry.buffer, 1, &copy)
 	}
 
-	copy := vk.BufferCopy {
-		srcOffset = src_offset,
-		dstOffset = offset,
-		size      = vk.DeviceSize(byte_count),
-	}
-	vk.CmdCopyBuffer(cmd_buffer, src_buffer, dst_entry.buffer, 1, &copy)
-
-	// Host -> device synchronization barrier. The copy writes must be
-	// visible to compute / vertex / fragment shader reads.
+	// Single combined barrier covering every dirty range. The whole
+	// dirty-set is treated as one dependency edge for the downstream
+	// compute / vertex stages - the barrier cost is paid once per pool
+	// per frame regardless of how many ranges participated.
 	barrier := vk.BufferMemoryBarrier2 {
 		sType               = .BUFFER_MEMORY_BARRIER_2,
 		srcStageMask        = {.COPY},
@@ -455,7 +622,7 @@ vulkan_record_pool_upload :: proc(
 		dstQueueFamilyIndex = vk.QUEUE_FAMILY_IGNORED,
 		buffer              = dst_entry.buffer,
 		offset              = 0,
-		size                = vk.DeviceSize(byte_count),
+		size                = vk.DeviceSize(u64(count) * u64(stride)),
 	}
 	dep := vk.DependencyInfo {
 		sType                    = .DEPENDENCY_INFO,
@@ -464,9 +631,22 @@ vulkan_record_pool_upload :: proc(
 	}
 	vk.CmdPipelineBarrier2(cmd_buffer, &dep)
 
-	cursor.last_uploaded_to = count
+	// Diagnostics + cursor housekeeping.
+	clear(&cursor.ranges)
+	for r in ranges_buf do append(&cursor.ranges, r)
+	cursor.bytes = total_bytes
+	cursor.last_uploaded_to = max(cursor.last_uploaded_to, count)
+	clear(&cursor.dirty_slots)
+	clear(&cursor.dirty_entities)
+
 	// Update live metric on the entry; reflect the current dense count.
 	frame.buffers[kind].capacity = cursor.capacity
+	_ = slot_or_entity_dirty
+	diag_record_upload_bandwidth_with_kind(
+		.Frame_Transient,
+		MODULE_STATE_VALUE.frame_ctx.frame_idx,
+		total_bytes,
+	)
 	return true
 }
 
@@ -504,6 +684,11 @@ vulkan_upload_scene :: proc(
 ) -> bool {
 	if cmd_buffer == nil || frame == nil || gpu == nil do return false
 	if !VULKAN_STATE.initialized do return false
+
+	// Snapshot every arena's used / free into the diagnostics layer.
+	// Cheap; one record per arena. Does not change command-buffer
+	// contents.
+	gpu_arena_record_used_to_diagnostics()
 
 	ok := true
 
@@ -699,6 +884,69 @@ vulkan_end_command_buffer :: proc(cmd_buffer: vk.CommandBuffer) -> bool {
 		return false
 	}
 	return true
+}
+
+// ---------------------------------------------------------------------------
+// Dirty-range helpers.
+//
+// append_ranges_from_dirty_indices consumes an unsorted, deduplicated
+// list of u32 indices (slot or entity) and pushes one Dirty_Range per
+// element. Sorting and merging into disjoint ranges happens later in
+// merge_overlapping_ranges; this proc just translates the "dirty set"
+// into a flat range list the merge step can reason about.
+//
+// merge_overlapping_ranges sorts + dedupes a range list in place and
+// coalesces any touching or overlapping ranges into the minimal
+// disjoint set. Stable on already-sorted input (O(N)) in that case.
+// ---------------------------------------------------------------------------
+
+@(private)
+append_ranges_from_dirty_indices :: proc(out: ^[dynamic]Dirty_Range, dirty: []u32) {
+	for slot in dirty {
+		append(out, Dirty_Range{first = slot, last = slot + 1})
+	}
+}
+
+@(private)
+merge_overlapping_ranges :: proc(ranges: ^[dynamic]Dirty_Range) {
+	if len(ranges) <= 1 do return
+
+	// Sort by .first.
+	sort_dirty_ranges(ranges)
+
+	// Coalesce.
+	write := 1
+	for read in 1 ..< len(ranges) {
+		prev := &ranges[write - 1]
+		cur := &ranges[read]
+		if cur.first <= prev.last {
+			if cur.last > prev.last do prev.last = cur.last
+		} else {
+			if write != read do ranges[write] = cur^
+			write += 1
+		}
+	}
+
+	// Trim.
+	resize(ranges, write)
+}
+
+@(private)
+sort_dirty_ranges :: proc(ranges: ^[dynamic]Dirty_Range) {
+	// Simple insertion sort. Range lists per kind stay small (one entry
+	// per dirty element at most, typically O(hundreds) for a typical
+	// frame) so the O(N^2) worst case is acceptable here; pulling in
+	// the stdlib sort for one hot path is not worth the dependency.
+	n := len(ranges)
+	for i in 1 ..< n {
+		key := ranges[i]
+		j := i - 1
+		for j >= 0 && ranges[j].first > key.first {
+			ranges[j + 1] = ranges[j]
+			j -= 1
+		}
+		ranges[j + 1] = key
+	}
 }
 
 // ---------------------------------------------------------------------------
